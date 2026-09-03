@@ -7,15 +7,24 @@
 
   const COMPOSER_TRIGGERS = [
     "write something",
-    "what's on your mind",
+    "whats on your mind",
+    "viet gi do",
     "ban viet gi di",
-    "bạn viết gì đi",
     "ban dang nghi gi",
-    "bạn đang nghĩ gì",
     "create a public post",
     "create a post",
-    "tạo bài viết",
+    "create post",
     "tao bai viet",
+    "bat dau thao luan",
+    "start a discussion",
+  ];
+
+  const PHOTO_COMPOSER_TRIGGERS = [
+    "photo/video",
+    "photos/videos",
+    "photo and video",
+    "anh/video",
+    "add photo/video",
   ];
 
   const PHOTO_LABELS = [
@@ -117,10 +126,13 @@
           error: "Không gắn được ảnh. Hàng đợi đã tạm dừng để bạn kiểm tra composer.",
         };
       }
-      dialog = findComposerDialog() || dialog;
+      dialog = (await waitFor(() => findComposerDialog(), 8000)) || dialog;
     }
 
-    const textbox = findComposerTextbox(dialog);
+    const textbox = await waitFor(() => {
+      const root = findComposerDialog() || dialog;
+      return findComposerTextbox(root) || findComposerTextbox(document.body);
+    }, 8000);
     if (!textbox) {
       return { success: false, error: "Không tìm thấy ô soạn bài. Hãy mở composer thủ công rồi thử lại." };
     }
@@ -345,9 +357,10 @@
       const buttons = [...root.querySelectorAll('[role="button"], button, a')].filter(isVisible);
       for (const button of buttons) {
         const label = visibleLabel(button);
-        const matched = SEE_MORE_LABELS.some(
-          (item) => label === item || label.startsWith(`${item} `)
-        );
+        const matched = SEE_MORE_LABELS.some((item) => {
+          const text = normalize(item);
+          return label === text || label.startsWith(`${text} `);
+        });
         if (!matched) {
           continue;
         }
@@ -395,13 +408,22 @@
       return existing;
     }
 
-    const trigger = findComposerTrigger();
+    const trigger =
+      findComposerTrigger({ photoFallback: false }) ||
+      findComposerTrigger({ photoFallback: true });
     if (!trigger) {
       throw new Error("Không tìm thấy ô 'Viết gì đó' trên trang nhóm.");
     }
 
     humanClick(trigger);
-    const opened = await waitFor(() => findComposerDialog(), 8000);
+    let opened = await waitFor(() => findComposerDialog(), 8000);
+    if (!opened) {
+      const photoTrigger = findComposerTrigger({ photoFallback: true });
+      if (photoTrigger && photoTrigger !== trigger) {
+        humanClick(photoTrigger);
+        opened = await waitFor(() => findComposerDialog(), 8000);
+      }
+    }
     if (!opened) {
       throw new Error("Composer không mở sau khi bấm ô soạn bài.");
     }
@@ -409,34 +431,114 @@
   }
 
   function findComposerDialog() {
-    const dialogs = [...document.querySelectorAll('[role="dialog"]')];
+    const layers = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+    const dialog = layers.find((layer) => !isIgnoredComposerLayer(layer) && findComposerTextbox(layer));
+    if (dialog) {
+      return dialog;
+    }
+    return findExpandedInlineComposer();
+  }
+
+  function isIgnoredComposerLayer(layer) {
+    const label = visibleLabel(layer);
+    return /tin nhan|message|messenger|chat|search|tim kiem/.test(label);
+  }
+
+  function findExpandedInlineComposer() {
+    const main = document.querySelector('[role="main"]') || document.body;
+    const textbox = findComposerTextbox(main);
+    if (!textbox || !isOpenComposerEditor(textbox)) {
+      return null;
+    }
     return (
-      dialogs.find((dialog) => findComposerTextbox(dialog)) ||
-      null
+      textbox.closest('[role="dialog"], [aria-modal="true"], form, [role="form"]') ||
+      textbox.parentElement
     );
   }
 
+  function isOpenComposerEditor(el) {
+    const editable =
+      el.getAttribute("contenteditable") === "true" ||
+      el.getAttribute("data-lexical-editor") === "true";
+    const tall = el.getBoundingClientRect().height >= 64;
+    const root =
+      el.closest('[role="dialog"], [aria-modal="true"], form, [role="form"]') || el.parentElement;
+    return editable && (tall || Boolean(root && findPostButton(root)));
+  }
+
   function findComposerTextbox(root) {
-    const nodes = [...root.querySelectorAll('[role="textbox"], [contenteditable="true"]')];
-    const visible = nodes.filter(isVisible);
+    if (!root) {
+      return null;
+    }
+    const nodes = [
+      ...root.querySelectorAll(
+        '[role="textbox"], [contenteditable="true"], [data-lexical-editor="true"]'
+      ),
+    ];
+    const visible = nodes.filter((el) => isVisible(el) && isPostComposerField(el));
     if (visible.length === 0) {
       return null;
     }
-    visible.sort((a, b) => area(b) - area(a));
-    return visible[0];
+    const labeled = visible.filter(hasComposerFieldLabel);
+    const ranked = labeled.length ? labeled : visible;
+    ranked.sort((a, b) => area(b) - area(a));
+    return ranked[0];
   }
 
-  function findComposerTrigger() {
+  function isPostComposerField(el) {
+    if (el.closest('[role="article"]') && !el.closest('[role="dialog"], [aria-modal="true"]')) {
+      return false;
+    }
+    const label = fieldLabel(el);
+    return !/binh luan|comment|search|tim kiem|tin nhan|message|^aa$/.test(label);
+  }
+
+  function hasComposerFieldLabel(el) {
+    const label = fieldLabel(el);
+    if (!label) {
+      return false;
+    }
+    return COMPOSER_TRIGGERS.some((text) => label.includes(text) || label.startsWith(text));
+  }
+
+  function fieldLabel(el) {
+    return normalize(
+      [
+        el.getAttribute("aria-label"),
+        el.getAttribute("aria-placeholder"),
+        el.getAttribute("placeholder"),
+        el.innerText,
+      ]
+        .filter(Boolean)
+        .join(" ")
+    );
+  }
+
+  function findComposerTrigger(options = {}) {
     const feed = document.querySelector('[role="main"]') || document.body;
     const byLabel = findClickableByTexts(feed, COMPOSER_TRIGGERS);
     if (byLabel) {
       return byLabel;
     }
 
-    const boxes = [...feed.querySelectorAll('[role="textbox"], [contenteditable="true"]')].filter(
-      isVisible
+    const boxes = [
+      ...feed.querySelectorAll(
+        '[role="textbox"], [contenteditable="true"], [aria-placeholder], [data-lexical-editor="true"]'
+      ),
+    ].filter(
+      (el) =>
+        isVisible(el) &&
+        isPostComposerField(el) &&
+        !el.closest('[role="article"]')
     );
-    return boxes[0] || null;
+    if (boxes[0]) {
+      return boxes[0];
+    }
+
+    if (options.photoFallback) {
+      return findClickableByTexts(feed, PHOTO_COMPOSER_TRIGGERS);
+    }
+    return null;
   }
 
   async function fillText(textbox, text) {
@@ -880,7 +982,11 @@
     }
     const dialog = input.closest('[role="dialog"]');
     if (dialog) {
-      return Boolean(dialog.querySelector('[role="textbox"], [contenteditable="true"]'));
+      return Boolean(
+        dialog.querySelector(
+          '[role="textbox"], [contenteditable="true"], [data-lexical-editor="true"]'
+        )
+      );
     }
     // Facebook đôi khi gắn input composer vào body, không nằm trong dialog.
     return !input.closest('[role="main"]');
@@ -946,7 +1052,7 @@
     return (
       buttons.find((button) => {
         const label = visibleLabel(button);
-        return POST_LABELS.includes(label);
+        return POST_LABELS.map(normalize).includes(label);
       }) || null
     );
   }
@@ -959,6 +1065,9 @@
 
     while ((node = walker.nextNode())) {
       if (!isVisible(node)) {
+        continue;
+      }
+      if (node.closest('[role="article"]') && !node.closest('[role="dialog"], [aria-modal="true"]')) {
         continue;
       }
       const label = visibleLabel(node);
@@ -977,7 +1086,8 @@
       const clickable =
         node.closest('[role="button"]') ||
         node.closest("button") ||
-        (node.getAttribute("role") === "button" ? node : null);
+        node.closest('[role="textbox"]') ||
+        (["button", "textbox"].includes(node.getAttribute("role")) ? node : null);
       if (clickable && isVisible(clickable)) {
         best = clickable;
         break;
@@ -988,13 +1098,19 @@
 
   function visibleLabel(el) {
     const aria = el.getAttribute("aria-label") || "";
+    const placeholder = el.getAttribute("aria-placeholder") || el.getAttribute("placeholder") || "";
     const text = el.innerText || "";
-    return normalize(aria || text);
+    return normalize(aria || placeholder || text);
   }
 
   function normalize(value) {
-    return value
+    return String(value || "")
       .toLowerCase()
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/đ/g, "d")
+      .replace(/['’`]/g, "")
+      .replace(/[.…·•]+/g, " ")
       .replace(/\s+/g, " ")
       .trim();
   }

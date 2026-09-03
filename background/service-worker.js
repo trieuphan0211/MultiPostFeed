@@ -122,8 +122,16 @@ async function startQueue({ groupIds, text, imageIds }) {
     return { ok: false, error: "Nhập nội dung hoặc đính ít nhất một ảnh." };
   }
 
+  const preflight = await preflightFacebook();
+  if (!preflight.ok) {
+    return preflight;
+  }
+
   const groups = await getGroups();
-  const selected = groups.filter((group) => groupIds.includes(group.id));
+  const ids = Array.isArray(groupIds) ? groupIds : [];
+  const selected = groups.filter((group) =>
+    ids.some((id) => String(id) === String(group.id))
+  );
   if (selected.length === 0) {
     return { ok: false, error: "Chọn ít nhất một nhóm." };
   }
@@ -133,9 +141,9 @@ async function startQueue({ groupIds, text, imageIds }) {
   const alreadyPosted = new Set(
     history
       .filter((entry) => entry.status === "posted" && entry.contentKey === contentKey)
-      .map((entry) => entry.groupId)
+      .map((entry) => String(entry.groupId))
   );
-  const pending = selected.filter((group) => !alreadyPosted.has(group.id));
+  const pending = selected.filter((group) => !alreadyPosted.has(String(group.id)));
   const skippedCount = selected.length - pending.length;
   if (pending.length === 0) {
     return {
@@ -165,7 +173,7 @@ async function startQueue({ groupIds, text, imageIds }) {
     lastError: skippedCount ? `Bỏ qua ${skippedCount} nhóm đã đăng nội dung này.` : "",
     text: cleanText,
     imageIds: images,
-    tabId: current.tabId || null,
+    tabId: preflight.tabId || current.tabId || null,
   };
 
   await persistAndBroadcast(state);
@@ -313,10 +321,10 @@ async function runCurrentItem() {
     const error = result?.error || "Không đăng được bài.";
     item.status = "failed";
     item.error = error;
-    state.status = "paused";
-    state.lastError = error;
+    state.lastError = `Bỏ qua ${item.groupName}: ${error}`;
     await addHistory(historyEntry(state, item, "failed", error));
     await persistAndBroadcast(state);
+    await advanceOrFinish(state, { skipped: false });
   } finally {
     postingLock = false;
   }
@@ -383,11 +391,17 @@ async function continueAfterDelay() {
 
 async function finishQueue(state) {
   await chrome.alarms.clear(DELAY_ALARM);
-  const next = createIdleQueue();
-  next.tabId = state.tabId;
   const posted = state.items.filter((item) => item.status === "posted").length;
   const failed = state.items.filter((item) => item.status === "failed").length;
-  next.lastError = `Xong: ${posted} thành công, ${failed} lỗi, ${state.items.length} nhóm.`;
+  const next = {
+    ...createIdleQueue(),
+    tabId: state.tabId,
+    jobId: state.jobId,
+    items: state.items,
+    text: state.text,
+    imageIds: state.imageIds || [],
+    lastError: `Xong: ${posted} thành công, ${failed} lỗi.`,
+  };
   await persistAndBroadcast(next);
   return { ok: true, state: next };
 }
@@ -395,16 +409,29 @@ async function finishQueue(state) {
 async function pauseWithError(error) {
   await chrome.alarms.clear(DELAY_ALARM);
   const state = await getQueueState();
+  if (state.status === "idle") {
+    return;
+  }
+
   const item = state.items[state.currentIndex];
-  if (item && item.status === "posting") {
+  if (item && (item.status === "posting" || item.status === "pending")) {
     item.status = "failed";
     item.error = error;
     await addHistory(historyEntry(state, item, "failed", error));
   }
-  state.status = "paused";
-  state.lastError = error;
-  state.delayEndsAt = 0;
+
+  if (pauseRequested) {
+    pauseRequested = false;
+    state.status = "paused";
+    state.delayEndsAt = 0;
+    state.lastError = "Đã tạm dừng. Nhấn Tiếp tục khi sẵn sàng.";
+    await persistAndBroadcast(state);
+    return;
+  }
+
+  state.lastError = item ? `Bỏ qua ${item.groupName}: ${error}` : `Bỏ qua: ${error}`;
   await persistAndBroadcast(state);
+  await advanceOrFinish(state, { skipped: false });
 }
 
 async function persistAndBroadcast(state) {
@@ -426,6 +453,27 @@ function historyEntry(state, item, status, error, postUrl = "") {
     error,
     at: Date.now(),
   };
+}
+
+async function preflightFacebook() {
+  const tabs = await chrome.tabs.query({
+    url: ["https://www.facebook.com/*", "https://web.facebook.com/*"],
+  });
+  const usable = tabs.find((tab) => tab.id && tab.url && !/facebook\.com\/login/i.test(tab.url));
+  if (!usable) {
+    return { ok: false, error: "Mở Facebook đã đăng nhập rồi thử lại." };
+  }
+
+  try {
+    await waitForContentScript(usable.id);
+  } catch {
+    return {
+      ok: false,
+      error: "Không kết nối được tab Facebook. F5 trang Facebook rồi thử lại.",
+    };
+  }
+
+  return { ok: true, tabId: usable.id };
 }
 
 async function ensureGroupTab(state, url) {

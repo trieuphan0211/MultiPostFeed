@@ -32,6 +32,8 @@ const els = {
   addUrlBtn: document.getElementById("addUrlBtn"),
   addCurrentBtn: document.getElementById("addCurrentBtn"),
   scanGroupsBtn: document.getElementById("scanGroupsBtn"),
+  groupCount: document.getElementById("groupCount"),
+  groupFilterInput: document.getElementById("groupFilterInput"),
   selectAllBtn: document.getElementById("selectAllBtn"),
   groupList: document.getElementById("groupList"),
   groupEmpty: document.getElementById("groupEmpty"),
@@ -43,6 +45,11 @@ const els = {
   skipBtn: document.getElementById("skipBtn"),
   stopBtn: document.getElementById("stopBtn"),
   queueList: document.getElementById("queueList"),
+  failedPanel: document.getElementById("failedPanel"),
+  failedList: document.getElementById("failedList"),
+  retryFailedBtn: document.getElementById("retryFailedBtn"),
+  historyFilterInput: document.getElementById("historyFilterInput"),
+  historyStatusFilter: document.getElementById("historyStatusFilter"),
   historyList: document.getElementById("historyList"),
   historyEmpty: document.getElementById("historyEmpty"),
   clearHistoryBtn: document.getElementById("clearHistoryBtn"),
@@ -66,7 +73,9 @@ const ITEM_LABEL = {
 
 let groups = [];
 let selectedIds = new Set();
+let groupFilter = "";
 let imageIds = [];
+let historyEntries = [];
 let queueState = null;
 let countdownTimer = null;
 const objectUrls = new Map();
@@ -85,6 +94,7 @@ async function init() {
 
   groups = await getGroups();
   imageIds = draft.imageIds || [];
+  selectedIds = new Set((draft.selectedGroupIds || []).map(String));
   els.postText.value = draft.text || "";
   els.delayMinInput.value = String(settings.delayMinSeconds);
   els.delayMaxInput.value = String(settings.delayMaxSeconds);
@@ -100,6 +110,7 @@ async function init() {
   els.addUrlBtn.addEventListener("click", addGroupFromUrl);
   els.addCurrentBtn.addEventListener("click", addCurrentGroup);
   els.scanGroupsBtn.addEventListener("click", scanJoinedGroups);
+  els.groupFilterInput.addEventListener("input", onGroupFilterChange);
   els.selectAllBtn.addEventListener("click", toggleSelectAll);
   els.delayMinInput.addEventListener("change", onDelayChange);
   els.delayMaxInput.addEventListener("change", onDelayChange);
@@ -109,6 +120,9 @@ async function init() {
   els.skipBtn.addEventListener("click", () => send("SKIP_CURRENT"));
   els.stopBtn.addEventListener("click", () => send("STOP_QUEUE"));
   els.clearHistoryBtn.addEventListener("click", clearHistory);
+  els.retryFailedBtn.addEventListener("click", retryFailedGroups);
+  els.historyFilterInput.addEventListener("input", () => renderHistory(historyEntries));
+  els.historyStatusFilter.addEventListener("change", () => renderHistory(historyEntries));
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === "QUEUE_STATE") {
@@ -161,8 +175,10 @@ function applyQueueState(state) {
   els.scanGroupsBtn.disabled = lockForm || els.scanGroupsBtn.dataset.busy === "1";
 
   renderQueue(state.items);
+  renderFailed(state.items);
   startCountdown(state);
   getHistory().then(renderHistory);
+  updateStartButton();
 }
 
 function startCountdown(state) {
@@ -180,15 +196,38 @@ function startCountdown(state) {
   countdownTimer = setInterval(tick, 500);
 }
 
+function filteredGroups() {
+  const query = groupFilter.trim().toLowerCase();
+  if (!query) {
+    return groups;
+  }
+  return groups.filter((group) => {
+    const name = String(group.name || "").toLowerCase();
+    const url = String(group.url || "").toLowerCase();
+    return name.includes(query) || url.includes(query);
+  });
+}
+
 function renderGroups() {
+  const visible = filteredGroups();
   els.groupList.innerHTML = "";
-  els.groupEmpty.hidden = groups.length > 0;
-  for (const group of groups) {
+
+  if (groups.length === 0) {
+    els.groupEmpty.hidden = false;
+    els.groupEmpty.textContent = "Chưa có nhóm. Bấm Quét nhóm đã tham gia hoặc dán URL.";
+  } else if (visible.length === 0) {
+    els.groupEmpty.hidden = false;
+    els.groupEmpty.textContent = "Không có nhóm khớp bộ lọc.";
+  } else {
+    els.groupEmpty.hidden = true;
+  }
+
+  for (const group of visible) {
     const item = document.createElement("li");
     item.className = "group-item";
     item.innerHTML = `
       <label>
-        <input type="checkbox" data-id="${group.id}" ${selectedIds.has(group.id) ? "checked" : ""} />
+        <input type="checkbox" data-id="${group.id}" ${selectedIds.has(String(group.id)) ? "checked" : ""} />
         <span>
           <strong></strong>
           <small></small>
@@ -199,14 +238,70 @@ function renderGroups() {
     item.querySelector("strong").textContent = group.name;
     item.querySelector("small").textContent = group.url;
     item.querySelector("input").addEventListener("change", (event) => {
+      const id = String(group.id);
       if (event.target.checked) {
-        selectedIds.add(group.id);
+        selectedIds.add(id);
       } else {
-        selectedIds.delete(group.id);
+        selectedIds.delete(id);
       }
+      updateGroupSelectionUi();
+      persistSelection();
     });
     item.querySelector("[data-remove]").addEventListener("click", () => removeGroup(group.id));
     els.groupList.appendChild(item);
+  }
+
+  updateGroupSelectionUi();
+}
+
+function updateGroupSelectionUi() {
+  const visible = filteredGroups();
+  const selectedVisible = visible.filter((group) => selectedIds.has(String(group.id))).length;
+  const filtering = Boolean(groupFilter.trim());
+  const allVisibleSelected = visible.length > 0 && selectedVisible === visible.length;
+
+  els.groupCount.textContent = filtering
+    ? `Đã chọn ${selectedIds.size} / ${groups.length} · Hiện ${visible.length}`
+    : `Đã chọn ${selectedIds.size} / ${groups.length}`;
+
+  els.selectAllBtn.disabled = visible.length === 0;
+  if (filtering) {
+    els.selectAllBtn.textContent = allVisibleSelected ? "Bỏ chọn đang hiện" : "Chọn đang hiện";
+  } else {
+    els.selectAllBtn.textContent = allVisibleSelected ? "Bỏ chọn tất cả" : "Chọn tất cả";
+  }
+  updateStartButton();
+}
+
+function onGroupFilterChange(event) {
+  groupFilter = event.target.value;
+  renderGroups();
+}
+
+function renderFailed(items) {
+  const failed = (items || []).filter((item) => item.status === "failed");
+  els.failedList.innerHTML = "";
+  els.failedPanel.hidden = failed.length === 0;
+  const busy =
+    queueState?.status === "running" ||
+    queueState?.status === "delaying" ||
+    queueState?.status === "paused";
+  els.retryFailedBtn.disabled = busy || failed.length === 0;
+
+  for (const item of failed) {
+    const li = document.createElement("li");
+    li.className = "history-item";
+    li.innerHTML = `
+      <div>
+        <strong></strong>
+        <small></small>
+      </div>
+      <span class="badge badge-failed"></span>
+    `;
+    li.querySelector("strong").textContent = item.groupName;
+    li.querySelector("small").textContent = item.error || item.url || "";
+    li.querySelector(".badge").textContent = ITEM_LABEL.failed;
+    els.failedList.appendChild(li);
   }
 }
 
@@ -230,9 +325,23 @@ function renderQueue(items) {
 }
 
 function renderHistory(history) {
+  historyEntries = Array.isArray(history) ? history : [];
+  const query = normalizeFilter(els.historyFilterInput?.value);
+  const status = els.historyStatusFilter?.value || "";
+  const visible = historyEntries.filter((entry) => {
+    if (status && entry.status !== status) {
+      return false;
+    }
+    if (!query) {
+      return true;
+    }
+    const haystack = normalizeFilter(`${entry.groupName || ""} ${entry.textPreview || ""} ${entry.error || ""}`);
+    return haystack.includes(query);
+  });
+
   els.historyList.innerHTML = "";
-  els.historyEmpty.hidden = history.length > 0 || (queueState?.items || []).length > 0;
-  for (const entry of history) {
+  els.historyEmpty.hidden = historyEntries.length > 0 || (queueState?.items || []).length > 0;
+  for (const entry of visible) {
     const li = document.createElement("li");
     li.className = "history-item";
     li.innerHTML = `
@@ -406,6 +515,7 @@ async function scanJoinedGroups() {
     selectedIds.add(id);
   }
   renderGroups();
+  persistSelection();
   showNotice(response.message, true);
 }
 
@@ -433,6 +543,7 @@ function applyScanState(message) {
         selectedIds.add(id);
       }
       renderGroups();
+      persistSelection();
     });
     showNotice(message.message || "Đã quét xong.", true);
   }
@@ -450,27 +561,41 @@ async function upsertGroup(group) {
     showNotice("Nhóm này đã có trong danh sách.");
     selectedIds.add(duplicate.id);
     renderGroups();
+    persistSelection();
     return;
   }
   groups = await saveGroup(group);
   selectedIds.add(group.id);
   renderGroups();
+  persistSelection();
   showNotice("");
 }
 
 async function removeGroup(groupId) {
   groups = await deleteGroup(groupId);
-  selectedIds.delete(groupId);
+  selectedIds.delete(String(groupId));
   renderGroups();
+  persistSelection();
 }
 
 function toggleSelectAll() {
-  if (selectedIds.size === groups.length && groups.length > 0) {
-    selectedIds.clear();
-  } else {
-    selectedIds = new Set(groups.map((group) => group.id));
+  const visible = filteredGroups();
+  if (visible.length === 0) {
+    return;
   }
+
+  const allVisibleSelected = visible.every((group) => selectedIds.has(String(group.id)));
+  for (const group of visible) {
+    const id = String(group.id);
+    if (allVisibleSelected) {
+      selectedIds.delete(id);
+    } else {
+      selectedIds.add(id);
+    }
+  }
+
   renderGroups();
+  persistSelection();
 }
 
 async function onDelayChange() {
@@ -482,7 +607,34 @@ async function onDelayChange() {
   els.delayMaxInput.value = String(saved.delayMaxSeconds);
 }
 
+async function persistSelection() {
+  await saveDraft({
+    text: els.postText.value,
+    imageIds,
+    selectedGroupIds: [...selectedIds],
+  });
+}
+
+function updateStartButton() {
+  const n = selectedIds.size;
+  els.startBtn.textContent = n > 0 ? `Bắt đầu đăng (${n})` : "Bắt đầu đăng";
+}
+
+function normalizeFilter(value) {
+  return String(value || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 async function startQueue() {
+  const count = selectedIds.size;
+  if (count >= 10 && !window.confirm(`Đăng ${count} nhóm với nội dung hiện tại?`)) {
+    return;
+  }
   const response = await send("START_QUEUE", {
     groupIds: [...selectedIds],
     text: els.postText.value,
@@ -490,6 +642,27 @@ async function startQueue() {
   });
   if (!response?.ok) {
     showError(response?.error || "Không bắt đầu được hàng đợi.");
+    return;
+  }
+  applyQueueState(response.state);
+}
+
+async function retryFailedGroups() {
+  const failed = (queueState?.items || []).filter((item) => item.status === "failed" && item.groupId);
+  if (failed.length === 0) {
+    showNotice("Không có nhóm lỗi để đăng lại.");
+    return;
+  }
+  selectedIds = new Set(failed.map((item) => String(item.groupId)));
+  renderGroups();
+  persistSelection();
+  const response = await send("START_QUEUE", {
+    groupIds: [...selectedIds],
+    text: els.postText.value,
+    imageIds,
+  });
+  if (!response?.ok) {
+    showError(response?.error || "Không đăng lại được các nhóm lỗi.");
     return;
   }
   applyQueueState(response.state);
@@ -509,8 +682,9 @@ async function repostHistory(entry) {
     showNotice("Không xác định được nhóm để đăng lại.");
     return;
   }
-  selectedIds = new Set([entry.groupId]);
+  selectedIds = new Set([String(entry.groupId)]);
   renderGroups();
+  persistSelection();
   const response = await send("START_QUEUE", {
     groupIds: [entry.groupId],
     text: els.postText.value,

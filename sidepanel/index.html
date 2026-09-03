@@ -46,7 +46,7 @@
     <section class="panel">
       <div class="section-head">
         <h2>Nhóm</h2>
-        <button id="selectAllBtn" class="ghost" type="button">Chọn tất cả</button>
+        <span id="groupCount" class="meta">Đã chọn 0 / 0</span>
       </div>
       <div class="add-group">
         <input id="groupUrlInput" type="url" placeholder="Dán URL nhóm facebook.com/groups/…" />
@@ -56,6 +56,10 @@
           <button id="addCurrentBtn" class="ghost" type="button">Thêm nhóm hiện tại</button>
           <button id="scanGroupsBtn" class="ghost" type="button">Quét nhóm đã tham gia</button>
         </div>
+      </div>
+      <div class="group-toolbar">
+        <input id="groupFilterInput" type="search" placeholder="Lọc tên hoặc URL nhóm…" />
+        <button id="selectAllBtn" class="ghost" type="button">Chọn tất cả</button>
       </div>
       <ul id="groupList" class="group-list"></ul>
       <p id="groupEmpty" class="empty">Chưa có nhóm. Bấm Quét nhóm đã tham gia hoặc dán URL.</p>
@@ -86,12 +90,28 @@
         <button id="clearHistoryBtn" class="ghost" type="button">Xóa lịch sử</button>
       </div>
       <ul id="queueList" class="history-list"></ul>
+      <div id="failedPanel" hidden>
+        <div class="section-head">
+          <h2>Chưa đăng được</h2>
+          <button id="retryFailedBtn" class="ghost" type="button">Đăng lại các nhóm lỗi</button>
+        </div>
+        <ul id="failedList" class="history-list"></ul>
+      </div>
+      <div class="history-toolbar">
+        <input id="historyFilterInput" type="search" placeholder="Lọc lịch sử…" />
+        <select id="historyStatusFilter">
+          <option value="">Tất cả trạng thái</option>
+          <option value="posted">Xong</option>
+          <option value="failed">Lỗi</option>
+          <option value="skipped">Bỏ qua</option>
+        </select>
+      </div>
       <ul id="historyList" class="history-list"></ul>
       <p id="historyEmpty" class="empty">Chưa có lịch sử đăng.</p>
     </section>
 
     <p class="footnote">
-      Mở Facebook đã đăng nhập rồi quét nhóm đã tham gia. Đăng từng nhóm có delay. Nếu composer đổi giao diện, hàng đợi sẽ tạm dừng.
+      Mở Facebook đã đăng nhập rồi quét nhóm đã tham gia. Đăng từng nhóm có delay. Nhóm lỗi sẽ bỏ qua và chạy nhóm kế; cuối hàng đợi có thể đăng lại các nhóm lỗi.
     </p>
     <script type="module" src="app.js"></script>
   </body>
