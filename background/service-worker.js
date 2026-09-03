@@ -16,7 +16,7 @@ import {
 } from "../lib/groups.js";
 
 const DELAY_ALARM = "mpf-delay";
-const POST_TIMEOUT_MS = 90000;
+const POST_TIMEOUT_MS = 120000;
 const TAB_WAIT_MS = 25000;
 const PING_WAIT_MS = 20000;
 const SCAN_TIMEOUT_MS = 120000;
@@ -71,6 +71,8 @@ async function handleMessage(message) {
       return stopQueue();
     case "GET_CURRENT_GROUP":
       return getCurrentGroupFromTab();
+    case "GET_POST_IMAGE":
+      return getPostImage(message.imageId);
     case "SCAN_JOINED_GROUPS":
       return scanJoinedGroups();
     case "SCAN_PROGRESS":
@@ -265,8 +267,11 @@ async function runCurrentItem() {
       return;
     }
 
-    const images = await loadImagesForPost(state.imageIds);
-    const result = await requestPost(tabId, state.text, images);
+    const imageRecords = await getImages(state.imageIds || []);
+    if ((state.imageIds || []).length > 0 && imageRecords.length === 0) {
+      throw new Error("Không đọc được ảnh đã chọn. Thêm lại ảnh rồi thử.");
+    }
+    const result = await requestPost(tabId, state.text, state.imageIds);
     if (runId !== activeRunId) {
       return;
     }
@@ -459,20 +464,23 @@ async function waitForContentScript(tabId) {
   throw new Error("Không kết nối được content script trên tab Facebook.");
 }
 
-async function loadImagesForPost(imageIds) {
-  const records = await getImages(imageIds || []);
-  const images = [];
-  for (const record of records) {
-    images.push({
+async function getPostImage(imageId) {
+  const records = await getImages(imageId ? [imageId] : []);
+  const record = records[0];
+  if (!record?.blob) {
+    return { ok: false, error: "Không tìm thấy ảnh." };
+  }
+  return {
+    ok: true,
+    image: {
       name: record.name,
       mime: record.mime,
       dataBase64: await blobToBase64(record.blob),
-    });
-  }
-  return images;
+    },
+  };
 }
 
-function requestPost(tabId, text, images) {
+function requestPost(tabId, text, imageIds) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       resolve({ success: false, error: "Hết thời gian chờ Facebook xử lý bài đăng." });
@@ -480,7 +488,7 @@ function requestPost(tabId, text, images) {
 
     chrome.tabs.sendMessage(
       tabId,
-      { type: "POST_TO_GROUP", text, images },
+      { type: "POST_TO_GROUP", text, imageIds: imageIds || [] },
       (response) => {
         clearTimeout(timer);
         if (chrome.runtime.lastError) {

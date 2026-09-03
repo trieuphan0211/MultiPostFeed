@@ -20,10 +20,14 @@
   const PHOTO_LABELS = [
     "photo/video",
     "photo and video",
+    "photos/videos",
+    "add photo",
     "photos",
     "photo",
     "ảnh/video",
     "anh/video",
+    "thêm ảnh",
+    "them anh",
     "ảnh",
     "anh",
   ];
@@ -63,7 +67,8 @@
       return false;
     }
     if (message.type === "POST_TO_GROUP") {
-      postToGroup(message.text || "", message.images || [])
+      resolvePostImages(message.images || [], message.imageIds || [])
+        .then((images) => postToGroup(message.text || "", images))
         .then((result) => sendResponse(result))
         .catch((error) => {
           sendResponse({
@@ -92,7 +97,20 @@
       return { success: false, error: "Trang hiện tại không phải trang nhóm Facebook." };
     }
 
-    const dialog = await openComposer();
+    let dialog = await openComposer();
+
+    // Gắn ảnh trước: Facebook hay dựng lại dialog khi thêm media, làm mất chữ vừa gõ.
+    if (images.length > 0) {
+      const uploaded = await attachImages(dialog, images);
+      if (!uploaded) {
+        return {
+          success: false,
+          error: "Không gắn được ảnh. Hàng đợi đã tạm dừng để bạn kiểm tra composer.",
+        };
+      }
+      dialog = findComposerDialog() || dialog;
+    }
+
     const textbox = findComposerTextbox(dialog);
     if (!textbox) {
       return { success: false, error: "Không tìm thấy ô soạn bài. Hãy mở composer thủ công rồi thử lại." };
@@ -102,16 +120,7 @@
       await fillText(textbox, text);
     }
 
-    if (images.length > 0) {
-      const uploaded = await attachImages(dialog, images);
-      if (!uploaded) {
-        return {
-          success: false,
-          error: "Không gắn được ảnh. Hàng đợi đã tạm dừng để bạn kiểm tra composer.",
-        };
-      }
-    }
-
+    dialog = findComposerDialog() || dialog;
     const posted = await clickPostButton(dialog);
     if (!posted) {
       return {
@@ -129,6 +138,23 @@
     }
 
     return { success: true };
+  }
+
+  async function resolvePostImages(images, imageIds) {
+    if (images.length > 0) {
+      return images;
+    }
+    const loaded = [];
+    for (const imageId of imageIds) {
+      const response = await chrome.runtime.sendMessage({
+        type: "GET_POST_IMAGE",
+        imageId,
+      });
+      if (response?.ok && response.image) {
+        loaded.push(response.image);
+      }
+    }
+    return loaded;
   }
 
   function isLikelyGroupPage() {
@@ -364,75 +390,309 @@
   }
 
   async function fillText(textbox, text) {
+    const normalized = String(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     textbox.focus();
+    await sleep(150);
+    clearComposerText(textbox);
+
+    // Lexical của Facebook nuốt \n trong insertText; paste hoặc chèn từng dòng mới giữ xuống hàng.
+    dispatchPaste(textbox, normalized);
     await sleep(120);
-    document.execCommand("selectAll", false, null);
-    const inserted = document.execCommand("insertText", false, text);
-    if (!inserted) {
-      textbox.textContent = text;
-      textbox.dispatchEvent(
-        new InputEvent("input", {
-          bubbles: true,
-          cancelable: true,
-          inputType: "insertText",
-          data: text,
-        })
-      );
+    if (composerKeepsLineBreaks(textbox, normalized)) {
+      await sleep(150);
+      return;
+    }
+
+    clearComposerText(textbox);
+    const htmlInserted = document.execCommand("insertHTML", false, `<div>${plainTextToHtml(normalized)}</div>`);
+    await sleep(80);
+    if (htmlInserted && composerKeepsLineBreaks(textbox, normalized)) {
+      await sleep(150);
+      return;
+    }
+
+    clearComposerText(textbox);
+    const lines = normalized.split("\n");
+    for (let i = 0; i < lines.length; i += 1) {
+      if (lines[i]) {
+        const inserted = document.execCommand("insertText", false, lines[i]);
+        if (!inserted) {
+          insertTextFallback(textbox, lines[i]);
+        }
+      }
+      if (i < lines.length - 1) {
+        insertComposerLineBreak(textbox);
+      }
+      await sleep(20);
     }
     await sleep(250);
   }
 
-  async function attachImages(dialog, images) {
-    let input = findImageInput(dialog);
-    if (!input) {
-      const photoButton = findClickableByTexts(dialog, PHOTO_LABELS);
-      if (photoButton) {
-        humanClick(photoButton);
-        input = await waitFor(() => findImageInput(dialog) || findImageInput(document), 5000);
-      }
-    }
+  function clearComposerText(textbox) {
+    textbox.focus();
+    document.execCommand("selectAll", false, null);
+    document.execCommand("delete", false, null);
+  }
 
-    if (!input) {
+  function dispatchPaste(target, text) {
+    const dt = new DataTransfer();
+    dt.setData("text/plain", text);
+    dt.setData("text/html", plainTextToHtml(text));
+    try {
+      const event = new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      });
+      Object.defineProperty(event, "clipboardData", {
+        configurable: true,
+        value: dt,
+      });
+      target.dispatchEvent(event);
+      return true;
+    } catch {
       return false;
     }
+  }
 
-    const transfer = new DataTransfer();
-    for (const image of images) {
-      const bytes = base64ToUint8Array(image.dataBase64);
-      const file = new File([bytes], image.name || "image.jpg", {
-        type: image.mime || "image/jpeg",
-      });
-      transfer.items.add(file);
+  function plainTextToHtml(text) {
+    return text
+      .split("\n")
+      .map((line) => escapeHtml(line) || "<br>")
+      .join("<br>");
+  }
+
+  function escapeHtml(value) {
+    return value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  function composerContains(textbox, text) {
+    const actual = (textbox.innerText || textbox.textContent || "").replace(/\s+/g, " ").trim();
+    const sample = text.replace(/\s+/g, " ").trim().slice(0, 20);
+    return Boolean(actual) && (!sample || actual.includes(sample.slice(0, 12)));
+  }
+
+  function composerKeepsLineBreaks(textbox, text) {
+    if (!composerContains(textbox, text)) {
+      return false;
     }
+    const expectedBreaks = (text.match(/\n/g) || []).length;
+    if (expectedBreaks === 0) {
+      return true;
+    }
+    const actualBreaks = ((textbox.innerText || "").match(/\n/g) || []).length;
+    return actualBreaks >= 1;
+  }
 
-    const imageCountBefore = dialog.querySelectorAll("img").length;
-    input.files = transfer.files;
-    input.dispatchEvent(new Event("input", { bubbles: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-
-    return Boolean(
-      await waitFor(() => dialog.querySelectorAll("img").length > imageCountBefore, 8000)
+  function insertComposerLineBreak(textbox) {
+    if (document.execCommand("insertLineBreak")) {
+      return;
+    }
+    if (document.execCommand("insertParagraph")) {
+      return;
+    }
+    textbox.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Enter",
+        code: "Enter",
+        keyCode: 13,
+        which: 13,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      })
     );
   }
 
-  function findImageInput(root) {
-    const inputs = [...root.querySelectorAll('input[type="file"]')];
-    return (
-      inputs.find((input) => {
-        const accept = (input.getAttribute("accept") || "").toLowerCase();
-        return accept.includes("image") || accept.includes("video") || accept === "";
-      }) || null
+  function insertTextFallback(textbox, value) {
+    textbox.dispatchEvent(
+      new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: value,
+      })
     );
+    textbox.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: value,
+      })
+    );
+  }
+
+  async function attachImages(dialog, images) {
+    const files = imagesToFiles(images);
+    if (files.length === 0) {
+      return false;
+    }
+
+    const before = countMediaPreviews(dialog);
+    await sleep(300);
+
+    // Không bấm Photo/Video trước: nút đó mở file picker hệ thống và chặn gán file.
+    assignFilesToInputs(dialog, files);
+    if (await waitForPreview(dialog, before, 2500)) {
+      return true;
+    }
+
+    assignFilesToInputs(document, files);
+    if (await waitForPreview(dialog, before, 2500)) {
+      return true;
+    }
+
+    dropFilesOnComposer(dialog, files);
+    if (await waitForPreview(dialog, before, 8000)) {
+      return true;
+    }
+
+    const photoButton = findClickableByTexts(dialog, PHOTO_LABELS);
+    if (photoButton) {
+      humanClick(photoButton);
+      const input = await waitFor(
+        () => findImageInput(findComposerDialog() || dialog) || findImageInput(document),
+        4000
+      );
+      const liveDialog = findComposerDialog() || dialog;
+      if (input) {
+        assignFilesToInput(input, files);
+      } else {
+        assignFilesToInputs(liveDialog, files);
+        dropFilesOnComposer(liveDialog, files);
+      }
+    }
+
+    return Boolean(await waitForPreview(dialog, before, 20000));
+  }
+
+  function waitForPreview(dialog, before, timeout) {
+    return waitFor(() => {
+      const root = findComposerDialog() || dialog;
+      return countMediaPreviews(root) > before || hasUploadPreview(root);
+    }, timeout);
+  }
+
+  function imagesToFiles(images) {
+    const files = [];
+    for (const image of images) {
+      if (!image?.dataBase64) {
+        continue;
+      }
+      const bytes = base64ToUint8Array(image.dataBase64);
+      files.push(
+        new File([bytes], image.name || "image.jpg", {
+          type: image.mime || "image/jpeg",
+        })
+      );
+    }
+    return files;
+  }
+
+  function assignFilesToInputs(root, files) {
+    const inputs = findImageInputs(root);
+    for (const input of inputs) {
+      if (assignFilesToInput(input, files)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function assignFilesToInput(input, files) {
+    const dt = createFileTransfer(files);
+    input.removeAttribute("disabled");
+    try {
+      input.files = dt.files;
+    } catch {
+      return false;
+    }
+    if (!input.files || input.files.length === 0) {
+      return false;
+    }
+    input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    return true;
+  }
+
+  function dropFilesOnComposer(root, files) {
+    const dt = createFileTransfer(files);
+    const textbox = findComposerTextbox(root) || root;
+    const targets = [textbox, root].filter(Boolean);
+    for (const target of targets) {
+      for (const type of ["dragenter", "dragover", "drop"]) {
+        const event = new DragEvent(type, {
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+        });
+        Object.defineProperty(event, "dataTransfer", {
+          configurable: true,
+          value: dt,
+        });
+        target.dispatchEvent(event);
+      }
+    }
+    return true;
+  }
+
+  function createFileTransfer(files) {
+    const dt = new DataTransfer();
+    for (const file of files) {
+      dt.items.add(file);
+    }
+    return dt;
+  }
+
+  function findImageInputs(root) {
+    return [...root.querySelectorAll('input[type="file"]')].filter((input) => {
+      const accept = (input.getAttribute("accept") || "").toLowerCase();
+      return accept.includes("image") || accept.includes("video") || accept.includes("*") || accept === "";
+    });
+  }
+
+  function findImageInput(root) {
+    return findImageInputs(root)[0] || null;
+  }
+
+  function countMediaPreviews(root) {
+    return [...root.querySelectorAll("img")].filter((img) => {
+      const src = img.currentSrc || img.src || "";
+      const rect = img.getBoundingClientRect();
+      return (
+        rect.width >= 48 &&
+        rect.height >= 48 &&
+        (src.startsWith("blob:") || src.startsWith("data:") || /scontent|fbcdn/i.test(src))
+      );
+    }).length;
+  }
+
+  function hasUploadPreview(root) {
+    return [...root.querySelectorAll("[aria-label]")].some((el) =>
+      /remove photo|remove attachment|xóa ảnh|gỡ ảnh|edit photo|chỉnh sửa ảnh/i.test(
+        el.getAttribute("aria-label") || ""
+      )
+    );
+  }
+
+  function isUploading(root) {
+    const text = (root.innerText || "").toLowerCase();
+    return /đang tải|uploading|processing|đang xử lý/.test(text);
   }
 
   async function clickPostButton(dialog) {
     const button = await waitFor(() => {
-      const candidate = findPostButton(dialog);
-      if (!candidate || isDisabled(candidate)) {
+      const live = findComposerDialog() || dialog;
+      const candidate = findPostButton(live);
+      if (!candidate || isDisabled(candidate) || isUploading(live)) {
         return null;
       }
       return candidate;
-    }, 8000);
+    }, 20000);
 
     if (!button) {
       return false;
