@@ -309,6 +309,18 @@ button:disabled,
   word-break: break-all;
 }
 
+.history-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.history-actions button {
+  padding: 2px 8px;
+  font-size: 0.75rem;
+}
+
 .delay {
   display: flex;
   align-items: center;

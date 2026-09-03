@@ -1,5 +1,6 @@
 import {
   deleteGroup,
+  deleteHistory,
   deleteImages,
   getDraft,
   getGroups,
@@ -7,6 +8,7 @@ import {
   getImage,
   getQueueState,
   getSettings,
+  historyEntryId,
   putImage,
   saveDraft,
   saveGroup,
@@ -133,7 +135,7 @@ function applyQueueState(state) {
     : "0 / 0";
 
   if (state.lastError) {
-    const isInfo = /^(Xong:|Đã dừng|Đã tạm dừng|Sẽ tạm dừng)/.test(state.lastError);
+    const isInfo = /^(Xong:|Đã dừng|Đã tạm dừng|Sẽ tạm dừng|Bỏ qua)/.test(state.lastError);
     els.errorLabel.hidden = false;
     els.errorLabel.classList.toggle("is-info", isInfo);
     els.errorLabel.textContent = state.lastError;
@@ -237,12 +239,43 @@ function renderHistory(history) {
       <div>
         <strong></strong>
         <small></small>
+        <div class="history-actions"></div>
       </div>
       <span class="badge badge-${entry.status}"></span>
     `;
     li.querySelector("strong").textContent = entry.groupName;
     li.querySelector("small").textContent = formatHistory(entry);
     li.querySelector(".badge").textContent = ITEM_LABEL[entry.status] || entry.status;
+
+    const actions = li.querySelector(".history-actions");
+    const openBtn = document.createElement("button");
+    openBtn.type = "button";
+    openBtn.className = "ghost";
+    openBtn.textContent = "Mở";
+    openBtn.addEventListener("click", () => openHistory(entry));
+    actions.appendChild(openBtn);
+
+    if (entry.groupId) {
+      const busy =
+        queueState?.status === "running" ||
+        queueState?.status === "delaying" ||
+        queueState?.status === "paused";
+      const repostBtn = document.createElement("button");
+      repostBtn.type = "button";
+      repostBtn.className = "ghost";
+      repostBtn.textContent = "Đăng lại";
+      repostBtn.disabled = busy;
+      repostBtn.addEventListener("click", () => repostHistory(entry));
+      actions.appendChild(repostBtn);
+    }
+
+    const removeBtn = document.createElement("button");
+    removeBtn.type = "button";
+    removeBtn.className = "ghost";
+    removeBtn.textContent = "Xóa";
+    removeBtn.addEventListener("click", () => removeHistory(entry));
+    actions.appendChild(removeBtn);
+
     els.historyList.appendChild(li);
   }
 }
@@ -460,6 +493,39 @@ async function startQueue() {
     return;
   }
   applyQueueState(response.state);
+}
+
+async function openHistory(entry) {
+  const target = entry.postUrl || entry.url;
+  if (!target) {
+    showNotice("Không có URL bài hoặc nhóm để mở.");
+    return;
+  }
+  await chrome.tabs.create({ url: target, active: true });
+}
+
+async function repostHistory(entry) {
+  if (!entry.groupId) {
+    showNotice("Không xác định được nhóm để đăng lại.");
+    return;
+  }
+  selectedIds = new Set([entry.groupId]);
+  renderGroups();
+  const response = await send("START_QUEUE", {
+    groupIds: [entry.groupId],
+    text: els.postText.value,
+    imageIds,
+  });
+  if (!response?.ok) {
+    showError(response?.error || "Không đăng lại được nhóm này.");
+    return;
+  }
+  applyQueueState(response.state);
+}
+
+async function removeHistory(entry) {
+  const next = await deleteHistory(historyEntryId(entry));
+  renderHistory(next);
 }
 
 async function clearHistory() {

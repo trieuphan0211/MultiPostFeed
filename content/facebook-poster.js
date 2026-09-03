@@ -152,7 +152,38 @@
       };
     }
 
-    return { success: true };
+    return { success: true, postUrl: await findPostedPermalink(text) };
+  }
+
+  async function findPostedPermalink(text) {
+    const snippet = String(text || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 48);
+    await sleep(1500);
+
+    const articles = [...document.querySelectorAll('[role="article"]')].slice(0, 8);
+    for (const article of articles) {
+      const body = (article.innerText || "").replace(/\s+/g, " ");
+      if (snippet && !body.includes(snippet.slice(0, 24))) {
+        continue;
+      }
+      const link = article.querySelector(
+        'a[href*="/posts/"], a[href*="/permalink"], a[href*="story_fbid"]'
+      );
+      if (!link?.href) {
+        continue;
+      }
+      try {
+        const parsed = new URL(link.href, location.origin);
+        parsed.search = "";
+        parsed.hash = "";
+        return parsed.toString();
+      } catch {
+        return link.href;
+      }
+    }
+    return "";
   }
 
   async function resolvePostImages(images, imageIds) {

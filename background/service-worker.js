@@ -1,8 +1,10 @@
 import {
   addHistory,
   blobToBase64,
+  createContentKey,
   createIdleQueue,
   getGroups,
+  getHistory,
   getImages,
   getQueueState,
   getSettings,
@@ -126,6 +128,22 @@ async function startQueue({ groupIds, text, imageIds }) {
     return { ok: false, error: "Chọn ít nhất một nhóm." };
   }
 
+  const contentKey = createContentKey(cleanText, images);
+  const history = await getHistory();
+  const alreadyPosted = new Set(
+    history
+      .filter((entry) => entry.status === "posted" && entry.contentKey === contentKey)
+      .map((entry) => entry.groupId)
+  );
+  const pending = selected.filter((group) => !alreadyPosted.has(group.id));
+  const skippedCount = selected.length - pending.length;
+  if (pending.length === 0) {
+    return {
+      ok: false,
+      error: "Tất cả nhóm đã đăng nội dung này. Đổi nội dung hoặc xóa dòng lịch sử của nhóm đó.",
+    };
+  }
+
   pauseRequested = false;
   activeRunId += 1;
   const settings = await getSettings();
@@ -133,7 +151,7 @@ async function startQueue({ groupIds, text, imageIds }) {
     ...createIdleQueue(),
     status: "running",
     jobId: `job_${Date.now()}`,
-    items: selected.map((group) => ({
+    items: pending.map((group) => ({
       groupId: group.id,
       groupName: group.name,
       url: group.url,
@@ -144,7 +162,7 @@ async function startQueue({ groupIds, text, imageIds }) {
     delayMinSeconds: settings.delayMinSeconds,
     delayMaxSeconds: settings.delayMaxSeconds,
     delaySeconds: settings.delayMaxSeconds,
-    lastError: "",
+    lastError: skippedCount ? `Bỏ qua ${skippedCount} nhóm đã đăng nội dung này.` : "",
     text: cleanText,
     imageIds: images,
     tabId: current.tabId || null,
@@ -286,7 +304,7 @@ async function runCurrentItem() {
 
     if (result?.success) {
       item.status = "posted";
-      await addHistory(historyEntry(state, item, "posted", ""));
+      await addHistory(historyEntry(state, item, "posted", "", result.postUrl || ""));
       await persistAndBroadcast(state);
       await advanceOrFinish(state, { skipped: false });
       return;
@@ -394,12 +412,16 @@ async function persistAndBroadcast(state) {
   chrome.runtime.sendMessage({ type: "QUEUE_STATE", state }).catch(() => {});
 }
 
-function historyEntry(state, item, status, error) {
+function historyEntry(state, item, status, error, postUrl = "") {
   return {
+    id: `hist_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     jobId: state.jobId,
     groupId: item.groupId,
     groupName: item.groupName,
-    textPreview: state.text.slice(0, 140),
+    url: item.url || "",
+    contentKey: createContentKey(state.text, state.imageIds),
+    textPreview: (state.text || "").slice(0, 140),
+    postUrl: postUrl || "",
     status,
     error,
     at: Date.now(),
