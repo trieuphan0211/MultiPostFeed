@@ -29,6 +29,7 @@ const els = {
   groupNameInput: document.getElementById("groupNameInput"),
   addUrlBtn: document.getElementById("addUrlBtn"),
   addCurrentBtn: document.getElementById("addCurrentBtn"),
+  scanGroupsBtn: document.getElementById("scanGroupsBtn"),
   selectAllBtn: document.getElementById("selectAllBtn"),
   groupList: document.getElementById("groupList"),
   groupEmpty: document.getElementById("groupEmpty"),
@@ -94,6 +95,7 @@ async function init() {
   els.clearImagesBtn.addEventListener("click", clearImages);
   els.addUrlBtn.addEventListener("click", addGroupFromUrl);
   els.addCurrentBtn.addEventListener("click", addCurrentGroup);
+  els.scanGroupsBtn.addEventListener("click", scanJoinedGroups);
   els.selectAllBtn.addEventListener("click", toggleSelectAll);
   els.delayInput.addEventListener("change", onDelayChange);
   els.startBtn.addEventListener("click", startQueue);
@@ -106,6 +108,9 @@ async function init() {
   chrome.runtime.onMessage.addListener((message) => {
     if (message.type === "QUEUE_STATE") {
       applyQueueState(message.state);
+    }
+    if (message.type === "SCAN_STATE" || message.type === "SCAN_PROGRESS") {
+      applyScanState(message);
     }
   });
 }
@@ -147,6 +152,7 @@ function applyQueueState(state) {
   els.delayInput.disabled = busy;
   els.addUrlBtn.disabled = lockForm;
   els.addCurrentBtn.disabled = lockForm;
+  els.scanGroupsBtn.disabled = lockForm || els.scanGroupsBtn.dataset.busy === "1";
 
   renderQueue(state.items);
   startCountdown(state);
@@ -327,7 +333,7 @@ async function clearImages() {
 async function addGroupFromUrl() {
   const parsed = parseGroupUrl(els.groupUrlInput.value);
   if (!parsed) {
-    showError("URL không phải trang nhóm Facebook hợp lệ.");
+    showNotice("URL không phải trang nhóm Facebook hợp lệ.");
     return;
   }
   await upsertGroup({
@@ -343,16 +349,68 @@ async function addGroupFromUrl() {
 async function addCurrentGroup() {
   const response = await send("GET_CURRENT_GROUP");
   if (!response?.ok) {
-    showError(response?.error || "Không đọc được nhóm hiện tại.");
+    showNotice(response?.error || "Không đọc được nhóm hiện tại.");
     return;
   }
   await upsertGroup(response.group);
 }
 
+async function scanJoinedGroups() {
+  setScanBusy(true);
+  showNotice("Đang quét nhóm đã tham gia trên Facebook…", true);
+  const response = await send("SCAN_JOINED_GROUPS");
+  setScanBusy(false);
+  if (!response?.ok) {
+    showNotice(response?.error || "Không quét được danh sách nhóm.");
+    return;
+  }
+  groups = await getGroups();
+  for (const id of response.addedIds || []) {
+    selectedIds.add(id);
+  }
+  renderGroups();
+  showNotice(response.message, true);
+}
+
+function applyScanState(message) {
+  if (message.type === "SCAN_PROGRESS" && typeof message.found === "number") {
+    showNotice(`Đã thấy ${message.found} nhóm, đang cuộn thêm…`, true);
+    setScanBusy(true);
+    return;
+  }
+  if (typeof message.found === "number" && message.status === "running") {
+    showNotice(`Đã thấy ${message.found} nhóm, đang cuộn thêm…`, true);
+    setScanBusy(true);
+    return;
+  }
+  if (message.message && message.status === "running") {
+    showNotice(message.message, true);
+    setScanBusy(true);
+    return;
+  }
+  if (message.status === "done") {
+    setScanBusy(false);
+    getGroups().then((next) => {
+      groups = next;
+      for (const id of message.addedIds || []) {
+        selectedIds.add(id);
+      }
+      renderGroups();
+    });
+    showNotice(message.message || "Đã quét xong.", true);
+  }
+}
+
+function setScanBusy(busy) {
+  els.scanGroupsBtn.dataset.busy = busy ? "1" : "";
+  els.scanGroupsBtn.disabled = busy;
+  els.scanGroupsBtn.textContent = busy ? "Đang quét…" : "Quét nhóm đã tham gia";
+}
+
 async function upsertGroup(group) {
   const duplicate = groups.find((item) => sameGroup(item.url, group.url));
   if (duplicate) {
-    showError("Nhóm này đã có trong danh sách.");
+    showNotice("Nhóm này đã có trong danh sách.");
     selectedIds.add(duplicate.id);
     renderGroups();
     return;
@@ -360,7 +418,7 @@ async function upsertGroup(group) {
   groups = await saveGroup(group);
   selectedIds.add(group.id);
   renderGroups();
-  showError("");
+  showNotice("");
 }
 
 async function removeGroup(groupId) {
@@ -401,9 +459,14 @@ async function clearHistory() {
 }
 
 function showError(message) {
-  els.statusBar.hidden = false;
+  showNotice(message, false);
+}
+
+function showNotice(message, isInfo = false) {
+  els.statusBar.hidden = !message && (queueState?.status === "idle") && !(queueState?.items || []).length;
   els.errorLabel.hidden = !message;
-  els.errorLabel.textContent = message;
+  els.errorLabel.classList.toggle("is-info", Boolean(isInfo && message));
+  els.errorLabel.textContent = message || "";
 }
 
 function revokeUrl(id) {

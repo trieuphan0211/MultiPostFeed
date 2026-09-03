@@ -235,6 +235,11 @@ button:disabled,
   margin: 8px 0 0;
 }
 
+.group-list {
+  max-height: 280px;
+  overflow: auto;
+}
+
 .image-list {
   display: flex;
   flex-wrap: wrap;

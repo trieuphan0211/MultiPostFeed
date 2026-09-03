@@ -30,13 +30,51 @@
 
   const POST_LABELS = ["đăng", "dang", "post", "đăng bài", "dang bai"];
 
+  const GROUP_PATH_SKIP = new Set([
+    "feed",
+    "joins",
+    "discover",
+    "notifications",
+    "creates",
+    "search",
+  ]);
+
+  const SEE_MORE_LABELS = [
+    "see more",
+    "see all",
+    "show more",
+    "xem thêm",
+    "xem tất cả",
+    "hiện thêm",
+    "groups you've joined",
+    "your groups",
+    "nhóm bạn đã tham gia",
+    "nhóm của bạn",
+    "nhóm đã tham gia",
+  ];
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message.type === "PING") {
-      sendResponse({ ok: isLikelyGroupPage() });
+      sendResponse({
+        ok: true,
+        isGroup: isLikelyGroupPage(),
+        isJoins: isJoinsPage(),
+      });
       return false;
     }
     if (message.type === "POST_TO_GROUP") {
       postToGroup(message.text || "", message.images || [])
+        .then((result) => sendResponse(result))
+        .catch((error) => {
+          sendResponse({
+            success: false,
+            error: error.message || String(error),
+          });
+        });
+      return true;
+    }
+    if (message.type === "SCAN_JOINED_GROUPS") {
+      scanJoinedGroups()
         .then((result) => sendResponse(result))
         .catch((error) => {
           sendResponse({
@@ -94,7 +132,185 @@
   }
 
   function isLikelyGroupPage() {
-    return /\/groups\/[^/]+/i.test(location.pathname);
+    const match = location.pathname.match(/\/groups\/([^/]+)/i);
+    if (!match) {
+      return false;
+    }
+    return !GROUP_PATH_SKIP.has(decodeURIComponent(match[1]).toLowerCase());
+  }
+
+  function isJoinsPage() {
+    const path = location.pathname.replace(/\/+$/, "");
+    return (
+      path === "/groups" ||
+      path === "/groups/joins" ||
+      /joins|membership|your_groups/i.test(location.search)
+    );
+  }
+
+  async function scanJoinedGroups() {
+    await expandJoinedGroupLists();
+
+    let stableRounds = 0;
+    let lastCount = 0;
+    const started = Date.now();
+    const limitMs = 90000;
+
+    while (Date.now() - started < limitMs && stableRounds < 6) {
+      const groups = collectJoinedGroups();
+      chrome.runtime
+        .sendMessage({ type: "SCAN_PROGRESS", found: groups.length })
+        .catch(() => {});
+
+      if (groups.length <= lastCount) {
+        stableRounds += 1;
+      } else {
+        stableRounds = 0;
+        lastCount = groups.length;
+      }
+
+      clickSeeMoreButtons();
+      scrollGroupLists();
+      await sleep(750);
+    }
+
+    const groups = collectJoinedGroups();
+    if (groups.length === 0) {
+      return {
+        success: false,
+        error: "Không thấy nhóm nào. Hãy mở facebook.com/groups/joins rồi thử lại.",
+      };
+    }
+    return { success: true, groups };
+  }
+
+  async function expandJoinedGroupLists() {
+    if (!isJoinsPage()) {
+      const joinsLink = [...document.querySelectorAll("a[href*='/groups/joins']")].find(isVisible);
+      if (joinsLink) {
+        humanClick(joinsLink);
+        await sleep(1200);
+      }
+    }
+    clickSeeMoreButtons();
+    await sleep(400);
+  }
+
+  function collectJoinedGroups() {
+    const found = new Map();
+    const anchors = document.querySelectorAll('a[href*="/groups/"]');
+
+    for (const anchor of anchors) {
+      let parsed;
+      try {
+        parsed = new URL(anchor.href, location.origin);
+      } catch {
+        continue;
+      }
+
+      const match = parsed.pathname.match(/\/groups\/([^/]+)/i);
+      if (!match) {
+        continue;
+      }
+      const slug = decodeURIComponent(match[1]);
+      if (!slug || GROUP_PATH_SKIP.has(slug.toLowerCase())) {
+        continue;
+      }
+
+      const name = pickGroupName(anchor, slug);
+      const key = slug.toLowerCase();
+      const current = found.get(key);
+      if (!current || (current.name === slug && name !== slug)) {
+        found.set(key, {
+          slug,
+          name,
+          url: `${location.origin}/groups/${encodeURIComponent(slug)}/`,
+        });
+      }
+    }
+    return [...found.values()];
+  }
+
+  function pickGroupName(anchor, slug) {
+    const candidates = [
+      anchor.getAttribute("aria-label"),
+      anchor.innerText,
+      anchor.closest('[role="article"], [role="listitem"], [role="link"]')?.innerText,
+    ];
+
+    for (const raw of candidates) {
+      if (!raw) {
+        continue;
+      }
+      const line = raw
+        .split("\n")
+        .map((item) => item.trim())
+        .find((item) => item && !isJunkGroupLabel(item));
+      if (line) {
+        return line.slice(0, 120);
+      }
+    }
+    return slug;
+  }
+
+  function isJunkGroupLabel(text) {
+    return /^(join|tham gia|visit|xem|see all|see more|members|thành viên|\d)/i.test(text);
+  }
+
+  function clickSeeMoreButtons() {
+    const roots = [
+      document.querySelector('[role="main"]'),
+      ...document.querySelectorAll('[role="navigation"]'),
+    ].filter(Boolean);
+    const scope = roots.length ? roots : [document.body];
+    let clicks = 0;
+
+    for (const root of scope) {
+      const buttons = [...root.querySelectorAll('[role="button"], button, a')].filter(isVisible);
+      for (const button of buttons) {
+        const label = visibleLabel(button);
+        const matched = SEE_MORE_LABELS.some(
+          (item) => label === item || label.startsWith(`${item} `)
+        );
+        if (!matched) {
+          continue;
+        }
+        humanClick(button);
+        clicks += 1;
+        if (clicks >= 3) {
+          return;
+        }
+      }
+    }
+  }
+
+  function scrollGroupLists() {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    const roots = [
+      document.querySelector('[role="main"]'),
+      ...document.querySelectorAll('[role="navigation"], [role="feed"]'),
+    ].filter(Boolean);
+
+    for (const root of roots) {
+      const scroller = findScrollable(root);
+      if (scroller) {
+        scroller.scrollTop = scroller.scrollHeight;
+      }
+    }
+  }
+
+  function findScrollable(root) {
+    let node = root;
+    while (node && node !== document.body) {
+      const style = window.getComputedStyle(node);
+      const canScroll =
+        /(auto|scroll)/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 20;
+      if (canScroll) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return document.scrollingElement;
   }
 
   async function openComposer() {

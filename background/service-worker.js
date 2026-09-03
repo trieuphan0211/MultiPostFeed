@@ -6,18 +6,26 @@ import {
   getImages,
   getQueueState,
   getSettings,
+  saveGroups,
   setQueueState,
 } from "../lib/storage.js";
-import { createGroupId, parseGroupUrl } from "../lib/groups.js";
+import {
+  createGroupId,
+  isGroupsDirectoryUrl,
+  parseGroupUrl,
+} from "../lib/groups.js";
 
 const DELAY_ALARM = "mpf-delay";
 const POST_TIMEOUT_MS = 90000;
 const TAB_WAIT_MS = 25000;
 const PING_WAIT_MS = 20000;
+const SCAN_TIMEOUT_MS = 120000;
+const JOINS_URL = "https://www.facebook.com/groups/joins";
 
 let postingLock = false;
 let activeRunId = 0;
 let pauseRequested = false;
+let scanning = false;
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -63,6 +71,12 @@ async function handleMessage(message) {
       return stopQueue();
     case "GET_CURRENT_GROUP":
       return getCurrentGroupFromTab();
+    case "SCAN_JOINED_GROUPS":
+      return scanJoinedGroups();
+    case "SCAN_PROGRESS":
+    case "SCAN_STATE":
+    case "QUEUE_STATE":
+      return { ok: true };
     default:
       return { ok: false, error: "Unknown message" };
   }
@@ -521,6 +535,175 @@ async function getCurrentGroupFromTab() {
       addedAt: Date.now(),
     },
   };
+}
+
+async function scanJoinedGroups() {
+  const queue = await getQueueState();
+  if (queue.status === "running" || queue.status === "delaying") {
+    return { ok: false, error: "Đang đăng bài. Dừng hàng đợi trước khi quét nhóm." };
+  }
+  if (scanning) {
+    return { ok: false, error: "Đang quét nhóm, vui lòng đợi." };
+  }
+
+  scanning = true;
+  broadcastScan({ status: "running", found: 0, message: "Đang mở danh sách nhóm đã tham gia…" });
+
+  try {
+    const tabId = await ensureFacebookDirectoryTab(queue.tabId);
+    if (queue.tabId !== tabId) {
+      queue.tabId = tabId;
+      await setQueueState(queue);
+    }
+
+    await waitForContentScript(tabId);
+    broadcastScan({ status: "running", found: 0, message: "Đang cuộn và thu thập nhóm…" });
+
+    const result = await requestScan(tabId);
+    if (!result?.success) {
+      const error = result?.error || "Không quét được danh sách nhóm.";
+      broadcastScan({ status: "idle", found: 0, message: error });
+      return { ok: false, error };
+    }
+
+    const existing = await getGroups();
+    const merged = mergeScannedGroups(existing, result.groups || []);
+    await saveGroups(merged.groups);
+
+    const message = `Quét xong: thêm ${merged.added} nhóm mới, ${merged.skipped} đã có, tổng ${merged.groups.length}.`;
+    broadcastScan({
+      status: "done",
+      found: merged.groups.length,
+      added: merged.added,
+      skipped: merged.skipped,
+      addedIds: merged.addedIds,
+      message,
+    });
+    return {
+      ok: true,
+      added: merged.added,
+      skipped: merged.skipped,
+      total: merged.groups.length,
+      addedIds: merged.addedIds,
+      message,
+    };
+  } catch (error) {
+    const message = error.message || String(error);
+    broadcastScan({ status: "idle", found: 0, message });
+    return { ok: false, error: message };
+  } finally {
+    scanning = false;
+  }
+}
+
+async function ensureFacebookDirectoryTab(existingTabId) {
+  if (existingTabId) {
+    try {
+      const tab = await chrome.tabs.get(existingTabId);
+      if (tab && /facebook\.com/.test(tab.url || "")) {
+        await chrome.tabs.update(existingTabId, { url: JOINS_URL, active: true });
+        await waitForTabMatch(existingTabId, isGroupsDirectoryUrl);
+        return existingTabId;
+      }
+    } catch {
+      // Mở tab mới nếu tab cũ đã đóng.
+    }
+  }
+
+  const existing = await chrome.tabs.query({ url: "*://*.facebook.com/*" });
+  const reusable = existing[0];
+  if (reusable?.id) {
+    await chrome.tabs.update(reusable.id, { url: JOINS_URL, active: true });
+    await waitForTabMatch(reusable.id, isGroupsDirectoryUrl);
+    return reusable.id;
+  }
+
+  const tab = await chrome.tabs.create({ url: JOINS_URL, active: true });
+  await waitForTabMatch(tab.id, isGroupsDirectoryUrl);
+  return tab.id;
+}
+
+async function waitForTabMatch(tabId, matchFn) {
+  const started = Date.now();
+  while (Date.now() - started < TAB_WAIT_MS) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (matchFn(tab.url || "")) {
+        await sleep(1500);
+        return;
+      }
+    } catch {
+      throw new Error("Tab Facebook đã bị đóng.");
+    }
+    await sleep(350);
+  }
+  throw new Error("Hết thời gian chờ trang danh sách nhóm.");
+}
+
+function requestScan(tabId) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      resolve({ success: false, error: "Hết thời gian quét danh sách nhóm." });
+    }, SCAN_TIMEOUT_MS);
+
+    chrome.tabs.sendMessage(tabId, { type: "SCAN_JOINED_GROUPS" }, (response) => {
+      clearTimeout(timer);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      resolve(response || { success: false, error: "Không nhận được danh sách nhóm." });
+    });
+  });
+}
+
+function mergeScannedGroups(existing, scanned) {
+  const bySlug = new Map();
+  for (const group of existing) {
+    const parsed = parseGroupUrl(group.url);
+    bySlug.set((parsed?.slug || group.id).toLowerCase(), group);
+  }
+
+  let added = 0;
+  let skipped = 0;
+  const addedIds = [];
+  const now = Date.now();
+
+  for (const item of scanned) {
+    const slug = String(item.slug || "").toLowerCase();
+    if (!slug) {
+      continue;
+    }
+    const current = bySlug.get(slug);
+    if (current) {
+      skipped += 1;
+      if (current.name === slug || current.name === current.id.replace(/^grp_/, "")) {
+        current.name = item.name || current.name;
+      }
+      continue;
+    }
+
+    const group = {
+      id: createGroupId(slug),
+      name: item.name || slug,
+      url: item.url || `https://www.facebook.com/groups/${encodeURIComponent(slug)}/`,
+      addedAt: now,
+    };
+    bySlug.set(slug, group);
+    addedIds.push(group.id);
+    added += 1;
+  }
+
+  return {
+    groups: [...bySlug.values()],
+    added,
+    skipped,
+    addedIds,
+  };
+}
+
+function broadcastScan(payload) {
+  chrome.runtime.sendMessage({ type: "SCAN_STATE", ...payload }).catch(() => {});
 }
 
 function sleep(ms) {
