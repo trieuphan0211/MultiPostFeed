@@ -63,6 +63,8 @@ async function handleMessage(message, sender) {
       return fillPageComposer(sender?.tab?.id, message.text);
     case "ARM_PAGE_FILES":
       return armPageFiles(sender?.tab?.id, message.images || []);
+    case "DISARM_PAGE_FILES":
+      return disarmPageFiles(sender?.tab?.id);
     case "START_QUEUE":
       return startQueue(message);
     case "PAUSE_QUEUE":
@@ -139,7 +141,9 @@ async function startQueue({ groupIds, text, imageIds }) {
       error: "",
     })),
     currentIndex: 0,
-    delaySeconds: settings.delaySeconds,
+    delayMinSeconds: settings.delayMinSeconds,
+    delayMaxSeconds: settings.delayMaxSeconds,
+    delaySeconds: settings.delayMaxSeconds,
     lastError: "",
     text: cleanText,
     imageIds: images,
@@ -330,10 +334,22 @@ async function advanceOrFinish(state, { skipped }) {
   }
 
   state.status = "delaying";
-  state.delayEndsAt = Date.now() + state.delaySeconds * 1000;
+  const waitSeconds = randomDelaySeconds(state);
+  state.delaySeconds = waitSeconds;
+  state.delayEndsAt = Date.now() + waitSeconds * 1000;
   await persistAndBroadcast(state);
   chrome.alarms.create(DELAY_ALARM, { when: state.delayEndsAt });
   return { ok: true, state };
+}
+
+function randomDelaySeconds(state) {
+  const min = Number(state.delayMinSeconds);
+  const max = Number(state.delayMaxSeconds);
+  const low = Number.isFinite(min) ? min : 30;
+  const high = Number.isFinite(max) ? max : Number(state.delaySeconds) || 60;
+  const from = Math.min(low, high);
+  const to = Math.max(low, high);
+  return from + Math.floor(Math.random() * (to - from + 1));
 }
 
 async function continueAfterDelay() {
@@ -497,6 +513,18 @@ async function armPageFiles(tabId, images) {
     args: [images],
   });
   return injection?.result || { ok: false, error: "Không chuẩn bị được ảnh." };
+}
+
+async function disarmPageFiles(tabId) {
+  if (!tabId) {
+    return { ok: false, error: "Không có tab Facebook." };
+  }
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: pageClearPendingFiles,
+  });
+  return injection?.result || { ok: true };
 }
 
 function pageFillComposer(text) {
@@ -674,19 +702,42 @@ function pageFillComposer(text) {
 }
 
 function pageInstallFileHook() {
-  if (window.__mpfMainFileHook) {
+  if (window.__mpfFileHookVersion === 2) {
     return { ok: true, already: true };
   }
-  window.__mpfMainFileHook = true;
-  window.__mpfPendingFiles = window.__mpfPendingFiles || null;
 
   const proto = HTMLInputElement.prototype;
-  const originalClick = proto.click;
-  const originalShowPicker = proto.showPicker;
+  if (!window.__mpfNativeInputClick) {
+    window.__mpfNativeInputClick = proto.click;
+    window.__mpfNativeShowPicker = proto.showPicker;
+  } else {
+    proto.click = window.__mpfNativeInputClick;
+    if (typeof window.__mpfNativeShowPicker === "function") {
+      proto.showPicker = window.__mpfNativeShowPicker;
+    }
+  }
+
+  window.__mpfMainFileHook = true;
+  window.__mpfFileHookVersion = 2;
+  window.__mpfPendingFiles = window.__mpfPendingFiles || null;
+
+  const originalClick = window.__mpfNativeInputClick;
+  const originalShowPicker = window.__mpfNativeShowPicker;
+
+  const isComposerInput = (input) => {
+    if (!input || input.closest('[role="article"], [role="feed"]')) {
+      return false;
+    }
+    const dialog = input.closest('[role="dialog"]');
+    if (dialog) {
+      return Boolean(dialog.querySelector('[role="textbox"], [contenteditable="true"]'));
+    }
+    return !input.closest('[role="main"]');
+  };
 
   const assign = (input) => {
     const pending = window.__mpfPendingFiles;
-    if (!pending || !pending.length) {
+    if (!pending || !pending.length || !isComposerInput(input)) {
       return false;
     }
     const dt = new DataTransfer();
@@ -723,6 +774,11 @@ function pageInstallFileHook() {
   }
 
   return { ok: true, already: false };
+}
+
+function pageClearPendingFiles() {
+  window.__mpfPendingFiles = null;
+  return { ok: true };
 }
 
 function pageSetPendingFiles(payloads) {

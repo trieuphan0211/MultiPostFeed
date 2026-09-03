@@ -33,7 +33,8 @@ const els = {
   selectAllBtn: document.getElementById("selectAllBtn"),
   groupList: document.getElementById("groupList"),
   groupEmpty: document.getElementById("groupEmpty"),
-  delayInput: document.getElementById("delayInput"),
+  delayMinInput: document.getElementById("delayMinInput"),
+  delayMaxInput: document.getElementById("delayMaxInput"),
   startBtn: document.getElementById("startBtn"),
   pauseBtn: document.getElementById("pauseBtn"),
   resumeBtn: document.getElementById("resumeBtn"),
@@ -83,7 +84,8 @@ async function init() {
   groups = await getGroups();
   imageIds = draft.imageIds || [];
   els.postText.value = draft.text || "";
-  els.delayInput.value = String(settings.delaySeconds);
+  els.delayMinInput.value = String(settings.delayMinSeconds);
+  els.delayMaxInput.value = String(settings.delayMaxSeconds);
   renderGroups();
   await renderImages();
   updateDraftMeta();
@@ -97,7 +99,8 @@ async function init() {
   els.addCurrentBtn.addEventListener("click", addCurrentGroup);
   els.scanGroupsBtn.addEventListener("click", scanJoinedGroups);
   els.selectAllBtn.addEventListener("click", toggleSelectAll);
-  els.delayInput.addEventListener("change", onDelayChange);
+  els.delayMinInput.addEventListener("change", onDelayChange);
+  els.delayMaxInput.addEventListener("change", onDelayChange);
   els.startBtn.addEventListener("click", startQueue);
   els.pauseBtn.addEventListener("click", () => send("PAUSE_QUEUE"));
   els.resumeBtn.addEventListener("click", () => send("RESUME_QUEUE"));
@@ -149,7 +152,8 @@ function applyQueueState(state) {
   const lockForm = busy || paused;
   els.postText.disabled = lockForm;
   els.imageInput.disabled = lockForm;
-  els.delayInput.disabled = busy;
+  els.delayMinInput.disabled = busy;
+  els.delayMaxInput.disabled = busy;
   els.addUrlBtn.disabled = lockForm;
   els.addCurrentBtn.disabled = lockForm;
   els.scanGroupsBtn.disabled = lockForm || els.scanGroupsBtn.dataset.busy === "1";
@@ -437,7 +441,12 @@ function toggleSelectAll() {
 }
 
 async function onDelayChange() {
-  await saveSettings({ delaySeconds: Number(els.delayInput.value) });
+  const saved = await saveSettings({
+    delayMinSeconds: Number(els.delayMinInput.value),
+    delayMaxSeconds: Number(els.delayMaxInput.value),
+  });
+  els.delayMinInput.value = String(saved.delayMinSeconds);
+  els.delayMaxInput.value = String(saved.delayMaxSeconds);
 }
 
 async function startQueue() {

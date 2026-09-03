@@ -3,6 +3,7 @@
     return;
   }
   window.__mpfPosterInstalled = true;
+  let postingInFlight = false;
 
   const COMPOSER_TRIGGERS = [
     "write something",
@@ -67,6 +68,11 @@
       return false;
     }
     if (message.type === "POST_TO_GROUP") {
+      if (postingInFlight) {
+        sendResponse({ success: false, error: "Đang đăng bài, vui lòng đợi." });
+        return false;
+      }
+      postingInFlight = true;
       resolvePostImages(message.images || [], message.imageIds || [])
         .then((images) => postToGroup(message.text || "", images))
         .then((result) => sendResponse(result))
@@ -75,6 +81,9 @@
             success: false,
             error: error.message || String(error),
           });
+        })
+        .finally(() => {
+          postingInFlight = false;
         });
       return true;
     }
@@ -658,8 +667,8 @@
     });
     const restore = hookFileChooser(files);
     try {
+      // Chỉ gán file trong composer. Input trên document thường là ảnh comment bài gần nhất.
       assignFilesToInputs(dialog, files);
-      assignFilesToInputs(document, files);
       if (await waitForPreview(dialog, before, 2000)) {
         return true;
       }
@@ -669,7 +678,6 @@
         return true;
       }
 
-      // Hook input.click/showPicker trước, rồi mới bấm Photo — tránh file picker Windows.
       const photoButton = findPhotoButton(dialog);
       if (photoButton) {
         humanClick(photoButton);
@@ -677,6 +685,7 @@
       return Boolean(await waitForPreview(dialog, before, 18000));
     } finally {
       restore();
+      await chrome.runtime.sendMessage({ type: "DISARM_PAGE_FILES" }).catch(() => {});
     }
   }
 
@@ -701,7 +710,7 @@
     const originalShowPicker = proto.showPicker;
 
     const intercept = function interceptFileChooser() {
-      if (this.type === "file") {
+      if (this.type === "file" && isComposerFileInput(this)) {
         assignFilesToInput(this, files);
         return;
       }
@@ -711,7 +720,7 @@
     proto.click = intercept;
     if (typeof originalShowPicker === "function") {
       proto.showPicker = function interceptShowPicker() {
-        if (this.type === "file") {
+        if (this.type === "file" && isComposerFileInput(this)) {
           assignFilesToInput(this, files);
           return;
         }
@@ -729,7 +738,9 @@
             ? [node]
             : [...(node.querySelectorAll?.('input[type="file"]') || [])];
           for (const input of inputs) {
-            assignFilesToInput(input, files);
+            if (isComposerFileInput(input)) {
+              assignFilesToInput(input, files);
+            }
           }
         }
       }
@@ -832,8 +843,23 @@
     return dt;
   }
 
+  function isComposerFileInput(input) {
+    if (!input || input.closest('[role="article"], [role="feed"]')) {
+      return false;
+    }
+    const dialog = input.closest('[role="dialog"]');
+    if (dialog) {
+      return Boolean(dialog.querySelector('[role="textbox"], [contenteditable="true"]'));
+    }
+    // Facebook đôi khi gắn input composer vào body, không nằm trong dialog.
+    return !input.closest('[role="main"]');
+  }
+
   function findImageInputs(root) {
     return [...root.querySelectorAll('input[type="file"]')].filter((input) => {
+      if (!isComposerFileInput(input)) {
+        return false;
+      }
       const accept = (input.getAttribute("accept") || "").toLowerCase();
       return accept.includes("image") || accept.includes("video") || accept.includes("*") || accept === "";
     });
@@ -982,9 +1008,11 @@
     el.dispatchEvent(new MouseEvent("mousedown", opts));
     el.dispatchEvent(new PointerEvent("pointerup", opts));
     el.dispatchEvent(new MouseEvent("mouseup", opts));
-    el.dispatchEvent(new MouseEvent("click", opts));
+    // Chỉ một lần click: vừa dispatch vừa el.click() sẽ mở 2 composer/popup.
     if (typeof el.click === "function") {
       el.click();
+    } else {
+      el.dispatchEvent(new MouseEvent("click", opts));
     }
   }
 
