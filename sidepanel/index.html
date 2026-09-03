@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MultiPostFeed</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Facebook groups</p>
+        <h1>MultiPostFeed</h1>
+      </div>
+      <span id="statusPill" class="pill pill-idle">Sẵn sàng</span>
+    </header>
+
+    <section id="statusBar" class="status-bar" hidden>
+      <div class="status-row">
+        <strong id="progressLabel">0 / 0</strong>
+        <span id="delayLabel"></span>
+      </div>
+      <p id="errorLabel" class="error" hidden></p>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Soạn bài</h2>
+        <span id="draftMeta" class="meta">0 chữ</span>
+      </div>
+      <textarea
+        id="postText"
+        rows="7"
+        placeholder="Nội dung sẽ điền vào composer của từng nhóm…"
+      ></textarea>
+      <div id="imageList" class="image-list" hidden></div>
+      <div class="row">
+        <label class="file-btn">
+          Thêm ảnh
+          <input id="imageInput" type="file" accept="image/*" multiple hidden />
+        </label>
+        <button id="clearImagesBtn" class="ghost" type="button" hidden>Xóa ảnh</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Nhóm</h2>
+        <button id="selectAllBtn" class="ghost" type="button">Chọn tất cả</button>
+      </div>
+      <div class="add-group">
+        <input id="groupUrlInput" type="url" placeholder="Dán URL nhóm facebook.com/groups/…" />
+        <input id="groupNameInput" type="text" placeholder="Tên gợi nhớ (tuỳ chọn)" />
+        <div class="row">
+          <button id="addUrlBtn" type="button">Thêm URL</button>
+          <button id="addCurrentBtn" class="ghost" type="button">Thêm nhóm hiện tại</button>
+        </div>
+      </div>
+      <ul id="groupList" class="group-list"></ul>
+      <p id="groupEmpty" class="empty">Chưa có nhóm. Mở một trang nhóm rồi bấm Thêm nhóm hiện tại.</p>
+    </section>
+
+    <section class="panel controls">
+      <label class="delay">
+        Delay giữa các nhóm
+        <span><input id="delayInput" type="number" min="20" max="120" step="5" /> giây</span>
+      </label>
+      <div class="row actions">
+        <button id="startBtn" class="primary" type="button">Bắt đầu đăng</button>
+        <button id="pauseBtn" class="ghost" type="button" hidden>Tạm dừng</button>
+        <button id="resumeBtn" class="primary" type="button" hidden>Tiếp tục</button>
+        <button id="skipBtn" class="ghost" type="button" hidden>Bỏ qua</button>
+        <button id="stopBtn" class="danger" type="button" hidden>Dừng</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-head">
+        <h2>Hàng đợi / lịch sử</h2>
+        <button id="clearHistoryBtn" class="ghost" type="button">Xóa lịch sử</button>
+      </div>
+      <ul id="queueList" class="history-list"></ul>
+      <ul id="historyList" class="history-list"></ul>
+      <p id="historyEmpty" class="empty">Chưa có lịch sử đăng.</p>
+    </section>
+
+    <p class="footnote">
+      Mở Facebook đã đăng nhập, thêm nhóm, rồi chạy từng nhóm có delay. Nếu composer đổi giao diện, hàng đợi sẽ tạm dừng — không bấm lung tung.
+    </p>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>
