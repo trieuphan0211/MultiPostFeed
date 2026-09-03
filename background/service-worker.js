@@ -38,8 +38,8 @@ chrome.runtime.onStartup.addListener(() => {
 recoverQueueAfterRestart();
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  handleMessage(message)
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  handleMessage(message, sender)
     .then(sendResponse)
     .catch((error) => {
       sendResponse({ ok: false, error: error.message || String(error) });
@@ -55,10 +55,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-async function handleMessage(message) {
+async function handleMessage(message, sender) {
   switch (message.type) {
     case "GET_STATE":
       return { ok: true, state: await getQueueState() };
+    case "FILL_PAGE_COMPOSER":
+      return fillPageComposer(sender?.tab?.id, message.text);
+    case "ARM_PAGE_FILES":
+      return armPageFiles(sender?.tab?.id, message.images || []);
     case "START_QUEUE":
       return startQueue(message);
     case "PAUSE_QUEUE":
@@ -462,6 +466,277 @@ async function waitForContentScript(tabId) {
     await sleep(300);
   }
   throw new Error("Không kết nối được content script trên tab Facebook.");
+}
+
+async function fillPageComposer(tabId, text) {
+  if (!tabId) {
+    return { ok: false, error: "Không có tab Facebook." };
+  }
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: pageFillComposer,
+    args: [text],
+  });
+  return injection?.result || { ok: false, error: "Không ghi được chữ vào composer." };
+}
+
+async function armPageFiles(tabId, images) {
+  if (!tabId) {
+    return { ok: false, error: "Không có tab Facebook." };
+  }
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: pageInstallFileHook,
+  });
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: pageSetPendingFiles,
+    args: [images],
+  });
+  return injection?.result || { ok: false, error: "Không chuẩn bị được ảnh." };
+}
+
+function pageFillComposer(text) {
+  function isLexicalEditor(value) {
+    return Boolean(
+      value &&
+        typeof value.getEditorState === "function" &&
+        typeof value.setEditorState === "function" &&
+        typeof value.parseEditorState === "function"
+    );
+  }
+
+  function pickEditor(value, depth) {
+    if (!value || depth > 4 || typeof value !== "object" || value instanceof Node) {
+      return null;
+    }
+    if (isLexicalEditor(value)) {
+      return value;
+    }
+    if (isLexicalEditor(value.editor)) {
+      return value.editor;
+    }
+    if (isLexicalEditor(value.lexicalEditor)) {
+      return value.lexicalEditor;
+    }
+    for (const key of ["editor", "lexicalEditor", "_editor", "current"]) {
+      if (value[key]) {
+        const found = pickEditor(value[key], depth + 1);
+        if (found) {
+          return found;
+        }
+      }
+    }
+    return null;
+  }
+
+  function findEditor(el) {
+    if (!el) {
+      return null;
+    }
+    let node = el;
+    for (let i = 0; i < 8 && node; i += 1) {
+      if (isLexicalEditor(node.__lexicalEditor)) {
+        return node.__lexicalEditor;
+      }
+      for (const key of Object.getOwnPropertyNames(node)) {
+        if (/lexical/i.test(key) && isLexicalEditor(node[key])) {
+          return node[key];
+        }
+      }
+      node = node.parentElement;
+    }
+
+    const fiberKey = Object.keys(el).find(
+      (key) => key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")
+    );
+    if (!fiberKey) {
+      return null;
+    }
+    let fiber = el[fiberKey];
+    for (let i = 0; i < 40 && fiber; i += 1) {
+      const bags = [fiber.memoizedProps, fiber.pendingProps, fiber.stateNode];
+      let hook = fiber.memoizedState;
+      while (hook) {
+        bags.push(hook.memoizedState);
+        hook = hook.next;
+      }
+      for (const bag of bags) {
+        const editor = pickEditor(bag, 0);
+        if (editor) {
+          return editor;
+        }
+      }
+      fiber = fiber.return;
+    }
+    return null;
+  }
+
+  function findTextNode(node) {
+    if (!node || typeof node !== "object") {
+      return null;
+    }
+    if (typeof node.text === "string" && /text/i.test(node.type || "text")) {
+      return node;
+    }
+    for (const child of node.children || []) {
+      const found = findTextNode(child);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  function hasAllLines(el, value) {
+    const actual = (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    const lines = value
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
+      return true;
+    }
+    return actual.includes(lines[0].slice(0, 24)) && actual.includes(lines[lines.length - 1].slice(0, 24));
+  }
+
+  const dialogs = [...document.querySelectorAll('[role="dialog"]')];
+  const textbox =
+    dialogs
+      .map((dialog) => {
+        const nodes = [...dialog.querySelectorAll('[role="textbox"], [contenteditable="true"]')];
+        return nodes.sort((a, b) => {
+          const areaA = a.getBoundingClientRect();
+          const areaB = b.getBoundingClientRect();
+          return areaB.width * areaB.height - areaA.width * areaA.height;
+        })[0];
+      })
+      .find(Boolean) || document.querySelector('[role="textbox"][contenteditable="true"]');
+
+  if (!textbox) {
+    return { ok: false, error: "no-textbox", hasAllLines: false };
+  }
+
+  textbox.focus();
+  const editor = findEditor(textbox);
+  if (editor) {
+    try {
+      const current = editor.getEditorState().toJSON();
+      if (current?.root?.children) {
+        const paragraphTemplate =
+          current.root.children.find((node) => node.type === "paragraph") ||
+          current.root.children[0] || {
+            children: [],
+            direction: "ltr",
+            format: "",
+            indent: 0,
+            type: "paragraph",
+            version: 1,
+          };
+        const textTemplate = findTextNode(paragraphTemplate) || {
+          detail: 0,
+          format: 0,
+          mode: "normal",
+          style: "",
+          text: "",
+          type: "text",
+          version: 1,
+        };
+        current.root.children = String(text)
+          .replace(/\r\n/g, "\n")
+          .replace(/\r/g, "\n")
+          .split("\n")
+          .map((line) => {
+            const paragraph = JSON.parse(JSON.stringify(paragraphTemplate));
+            const textNode = JSON.parse(JSON.stringify(textTemplate));
+            textNode.text = line;
+            paragraph.children = line ? [textNode] : [];
+            return paragraph;
+          });
+        editor.setEditorState(editor.parseEditorState(JSON.stringify(current)));
+        textbox.dispatchEvent(
+          new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" })
+        );
+      }
+    } catch (error) {
+      return { ok: false, error: String(error), hasAllLines: false, foundEditor: true };
+    }
+  }
+
+  return {
+    ok: true,
+    foundEditor: Boolean(editor),
+    hasAllLines: hasAllLines(textbox, text),
+  };
+}
+
+function pageInstallFileHook() {
+  if (window.__mpfMainFileHook) {
+    return { ok: true, already: true };
+  }
+  window.__mpfMainFileHook = true;
+  window.__mpfPendingFiles = window.__mpfPendingFiles || null;
+
+  const proto = HTMLInputElement.prototype;
+  const originalClick = proto.click;
+  const originalShowPicker = proto.showPicker;
+
+  const assign = (input) => {
+    const pending = window.__mpfPendingFiles;
+    if (!pending || !pending.length) {
+      return false;
+    }
+    const dt = new DataTransfer();
+    for (const file of pending) {
+      dt.items.add(file);
+    }
+    try {
+      input.files = dt.files;
+    } catch {
+      return false;
+    }
+    if (!input.files.length) {
+      return false;
+    }
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  };
+
+  proto.click = function () {
+    if (this.type === "file" && assign(this)) {
+      return;
+    }
+    return originalClick.apply(this, arguments);
+  };
+
+  if (typeof originalShowPicker === "function") {
+    proto.showPicker = function () {
+      if (this.type === "file" && assign(this)) {
+        return;
+      }
+      return originalShowPicker.apply(this, arguments);
+    };
+  }
+
+  return { ok: true, already: false };
+}
+
+function pageSetPendingFiles(payloads) {
+  window.__mpfPendingFiles = (payloads || []).map((item) => {
+    const binary = atob(item.dataBase64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return new File([bytes], item.name || "image.jpg", {
+      type: item.mime || "image/jpeg",
+    });
+  });
+  return { ok: true, count: window.__mpfPendingFiles.length };
 }
 
 async function getPostImage(imageId) {

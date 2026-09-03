@@ -117,7 +117,13 @@
     }
 
     if (text) {
-      await fillText(textbox, text);
+      const filled = await fillText(textbox, text);
+      if (!filled) {
+        return {
+          success: false,
+          error: "Composer chỉ nhận một phần nội dung (mất xuống hàng). Hàng đợi đã tạm dừng.",
+        };
+      }
     }
 
     dialog = findComposerDialog() || dialog;
@@ -144,15 +150,19 @@
     if (images.length > 0) {
       return images;
     }
+    if (imageIds.length === 0) {
+      return [];
+    }
     const loaded = [];
     for (const imageId of imageIds) {
       const response = await chrome.runtime.sendMessage({
         type: "GET_POST_IMAGE",
         imageId,
       });
-      if (response?.ok && response.image) {
-        loaded.push(response.image);
+      if (!response?.ok || !response.image?.dataBase64) {
+        throw new Error(response?.error || "Không tải được ảnh để đăng. Thêm lại ảnh rồi thử.");
       }
+      loaded.push(response.image);
     }
     return loaded;
   }
@@ -391,41 +401,216 @@
 
   async function fillText(textbox, text) {
     const normalized = String(text).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+    if (!normalized.trim()) {
+      return true;
+    }
+
     textbox.focus();
     await sleep(150);
-    clearComposerText(textbox);
 
-    // Lexical của Facebook nuốt \n trong insertText; paste hoặc chèn từng dòng mới giữ xuống hàng.
-    dispatchPaste(textbox, normalized);
-    await sleep(120);
-    if (composerKeepsLineBreaks(textbox, normalized)) {
+    // Phải ghi trong MAIN world: isolated world không thấy __lexicalEditor của Facebook.
+    const pageResult = await chrome.runtime.sendMessage({
+      type: "FILL_PAGE_COMPOSER",
+      text: normalized,
+    });
+    if (pageResult?.hasAllLines) {
       await sleep(150);
-      return;
+      return true;
+    }
+
+    // Lexical giữ state riêng: ghi DOM/`insertText` cả khối chỉ còn dòng đầu khi bấm Đăng.
+    const editor = getLexicalEditor(textbox);
+    if (editor && setLexicalText(editor, normalized)) {
+      textbox.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
+      await sleep(200);
+      if (composerHasAllLines(textbox, normalized)) {
+        return true;
+      }
     }
 
     clearComposerText(textbox);
-    const htmlInserted = document.execCommand("insertHTML", false, `<div>${plainTextToHtml(normalized)}</div>`);
-    await sleep(80);
-    if (htmlInserted && composerKeepsLineBreaks(textbox, normalized)) {
-      await sleep(150);
-      return;
+    try {
+      await navigator.clipboard.writeText(normalized);
+      textbox.focus();
+      document.execCommand("paste");
+      await sleep(250);
+      if (composerHasAllLines(textbox, normalized)) {
+        return true;
+      }
+    } catch {
+      // Content script có thể không ghi được clipboard.
     }
 
     clearComposerText(textbox);
     const lines = normalized.split("\n");
     for (let i = 0; i < lines.length; i += 1) {
+      textbox.focus();
+      placeCaretAtEnd(textbox);
       if (lines[i]) {
-        const inserted = document.execCommand("insertText", false, lines[i]);
-        if (!inserted) {
-          insertTextFallback(textbox, lines[i]);
-        }
+        document.execCommand("insertText", false, lines[i]);
       }
       if (i < lines.length - 1) {
-        insertComposerLineBreak(textbox);
+        textbox.dispatchEvent(
+          new InputEvent("beforeinput", {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            inputType: "insertParagraph",
+            data: null,
+          })
+        );
+        document.execCommand("insertParagraph");
       }
-      await sleep(20);
+      await sleep(40);
     }
-    await sleep(250);
+    await sleep(200);
+    return composerHasAllLines(textbox, normalized);
+  }
+
+  function getLexicalEditor(el) {
+    const direct = findLexicalOnNode(el);
+    if (direct) {
+      return direct;
+    }
+    let node = el.parentElement;
+    for (let i = 0; i < 8 && node; i += 1) {
+      const found = findLexicalOnNode(node);
+      if (found) {
+        return found;
+      }
+      node = node.parentElement;
+    }
+    return findLexicalInReact(el);
+  }
+
+  function findLexicalOnNode(el) {
+    if (!el) {
+      return null;
+    }
+    if (isLexicalEditor(el.__lexicalEditor)) {
+      return el.__lexicalEditor;
+    }
+    for (const key of Object.getOwnPropertyNames(el)) {
+      if (/lexical/i.test(key) && isLexicalEditor(el[key])) {
+        return el[key];
+      }
+    }
+    return null;
+  }
+
+  function isLexicalEditor(value) {
+    return Boolean(
+      value &&
+        typeof value.getEditorState === "function" &&
+        typeof value.setEditorState === "function" &&
+        typeof value.parseEditorState === "function"
+    );
+  }
+
+  function findLexicalInReact(el) {
+    const fiberKey = Object.keys(el).find(
+      (key) => key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")
+    );
+    if (!fiberKey) {
+      return null;
+    }
+    let fiber = el[fiberKey];
+    for (let i = 0; i < 40 && fiber; i += 1) {
+      const bags = [fiber.memoizedProps, fiber.pendingProps, fiber.stateNode];
+      let hook = fiber.memoizedState;
+      while (hook) {
+        bags.push(hook.memoizedState);
+        hook = hook.next;
+      }
+      for (const bag of bags) {
+        const editor = findEditorInValue(bag, 0);
+        if (editor) {
+          return editor;
+        }
+      }
+      fiber = fiber.return;
+    }
+    return null;
+  }
+
+  function findEditorInValue(value, depth) {
+    if (!value || depth > 4 || typeof value !== "object" || value instanceof Node) {
+      return null;
+    }
+    if (isLexicalEditor(value) || isLexicalEditor(value.editor) || isLexicalEditor(value.lexicalEditor)) {
+      return value.editor && isLexicalEditor(value.editor) ? value.editor : value.lexicalEditor || value;
+    }
+    for (const key of ["editor", "lexicalEditor", "_editor", "current"]) {
+      if (value[key]) {
+        const found = findEditorInValue(value[key], depth + 1);
+        if (found) {
+          return found;
+        }
+      }
+    }
+    return null;
+  }
+
+  function setLexicalText(editor, text) {
+    try {
+      const current = editor.getEditorState().toJSON();
+      if (!current?.root?.children) {
+        return false;
+      }
+      const paragraphTemplate =
+        current.root.children.find((node) => node.type === "paragraph") || defaultParagraphNode();
+      const textTemplate = findFirstTextNode(paragraphTemplate) || defaultTextNode();
+      current.root.children = text.split("\n").map((line) => {
+        const paragraph = structuredClone(paragraphTemplate);
+        const textNode = structuredClone(textTemplate);
+        textNode.text = line;
+        paragraph.children = line ? [textNode] : [];
+        return paragraph;
+      });
+      editor.setEditorState(editor.parseEditorState(JSON.stringify(current)));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function findFirstTextNode(node) {
+    if (!node || typeof node !== "object") {
+      return null;
+    }
+    if (typeof node.text === "string" && /text/i.test(node.type || "text")) {
+      return node;
+    }
+    for (const child of node.children || []) {
+      const found = findFirstTextNode(child);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  function defaultParagraphNode() {
+    return {
+      children: [],
+      direction: "ltr",
+      format: "",
+      indent: 0,
+      type: "paragraph",
+      version: 1,
+    };
+  }
+
+  function defaultTextNode() {
+    return {
+      detail: 0,
+      format: 0,
+      mode: "normal",
+      style: "",
+      text: "",
+      type: "text",
+      version: 1,
+    };
   }
 
   function clearComposerText(textbox) {
@@ -434,96 +619,30 @@
     document.execCommand("delete", false, null);
   }
 
-  function dispatchPaste(target, text) {
-    const dt = new DataTransfer();
-    dt.setData("text/plain", text);
-    dt.setData("text/html", plainTextToHtml(text));
-    try {
-      const event = new ClipboardEvent("paste", {
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-      });
-      Object.defineProperty(event, "clipboardData", {
-        configurable: true,
-        value: dt,
-      });
-      target.dispatchEvent(event);
-      return true;
-    } catch {
-      return false;
+  function placeCaretAtEnd(el) {
+    const selection = window.getSelection();
+    if (!selection) {
+      return;
     }
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
   }
 
-  function plainTextToHtml(text) {
-    return text
-      .split("\n")
-      .map((line) => escapeHtml(line) || "<br>")
-      .join("<br>");
-  }
-
-  function escapeHtml(value) {
-    return value
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-  }
-
-  function composerContains(textbox, text) {
+  function composerHasAllLines(textbox, text) {
     const actual = (textbox.innerText || textbox.textContent || "").replace(/\s+/g, " ").trim();
-    const sample = text.replace(/\s+/g, " ").trim().slice(0, 20);
-    return Boolean(actual) && (!sample || actual.includes(sample.slice(0, 12)));
-  }
-
-  function composerKeepsLineBreaks(textbox, text) {
-    if (!composerContains(textbox, text)) {
-      return false;
-    }
-    const expectedBreaks = (text.match(/\n/g) || []).length;
-    if (expectedBreaks === 0) {
+    const lines = text
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    if (lines.length === 0) {
       return true;
     }
-    const actualBreaks = ((textbox.innerText || "").match(/\n/g) || []).length;
-    return actualBreaks >= 1;
-  }
-
-  function insertComposerLineBreak(textbox) {
-    if (document.execCommand("insertLineBreak")) {
-      return;
-    }
-    if (document.execCommand("insertParagraph")) {
-      return;
-    }
-    textbox.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "Enter",
-        code: "Enter",
-        keyCode: 13,
-        which: 13,
-        bubbles: true,
-        cancelable: true,
-        composed: true,
-      })
-    );
-  }
-
-  function insertTextFallback(textbox, value) {
-    textbox.dispatchEvent(
-      new InputEvent("beforeinput", {
-        bubbles: true,
-        cancelable: true,
-        inputType: "insertText",
-        data: value,
-      })
-    );
-    textbox.dispatchEvent(
-      new InputEvent("input", {
-        bubbles: true,
-        cancelable: true,
-        inputType: "insertText",
-        data: value,
-      })
-    );
+    const first = lines[0].slice(0, 24);
+    const last = lines[lines.length - 1].slice(0, 24);
+    return actual.includes(first) && actual.includes(last);
   }
 
   async function attachImages(dialog, images) {
@@ -533,41 +652,97 @@
     }
 
     const before = countMediaPreviews(dialog);
-    await sleep(300);
-
-    // Không bấm Photo/Video trước: nút đó mở file picker hệ thống và chặn gán file.
-    assignFilesToInputs(dialog, files);
-    if (await waitForPreview(dialog, before, 2500)) {
-      return true;
-    }
-
-    assignFilesToInputs(document, files);
-    if (await waitForPreview(dialog, before, 2500)) {
-      return true;
-    }
-
-    dropFilesOnComposer(dialog, files);
-    if (await waitForPreview(dialog, before, 8000)) {
-      return true;
-    }
-
-    const photoButton = findClickableByTexts(dialog, PHOTO_LABELS);
-    if (photoButton) {
-      humanClick(photoButton);
-      const input = await waitFor(
-        () => findImageInput(findComposerDialog() || dialog) || findImageInput(document),
-        4000
-      );
-      const liveDialog = findComposerDialog() || dialog;
-      if (input) {
-        assignFilesToInput(input, files);
-      } else {
-        assignFilesToInputs(liveDialog, files);
-        dropFilesOnComposer(liveDialog, files);
+    await chrome.runtime.sendMessage({
+      type: "ARM_PAGE_FILES",
+      images,
+    });
+    const restore = hookFileChooser(files);
+    try {
+      assignFilesToInputs(dialog, files);
+      assignFilesToInputs(document, files);
+      if (await waitForPreview(dialog, before, 2000)) {
+        return true;
       }
+
+      dropFilesOnComposer(dialog, files);
+      if (await waitForPreview(dialog, before, 2500)) {
+        return true;
+      }
+
+      // Hook input.click/showPicker trước, rồi mới bấm Photo — tránh file picker Windows.
+      const photoButton = findPhotoButton(dialog);
+      if (photoButton) {
+        humanClick(photoButton);
+      }
+      return Boolean(await waitForPreview(dialog, before, 18000));
+    } finally {
+      restore();
+    }
+  }
+
+  function findPhotoButton(root) {
+    const byText = findClickableByTexts(root, PHOTO_LABELS);
+    if (byText) {
+      return byText;
+    }
+    const labeled = [...root.querySelectorAll("[aria-label], [role='button']")].find((el) => {
+      const label = (el.getAttribute("aria-label") || el.innerText || "").toLowerCase();
+      return /photo\/video|ảnh\/video|anh\/video|photos?\/videos?|add photo|thêm ảnh/.test(label);
+    });
+    if (!labeled) {
+      return null;
+    }
+    return labeled.closest("[role='button']") || labeled.closest("button") || labeled;
+  }
+
+  function hookFileChooser(files) {
+    const proto = HTMLInputElement.prototype;
+    const originalClick = proto.click;
+    const originalShowPicker = proto.showPicker;
+
+    const intercept = function interceptFileChooser() {
+      if (this.type === "file") {
+        assignFilesToInput(this, files);
+        return;
+      }
+      return originalClick.apply(this, arguments);
+    };
+
+    proto.click = intercept;
+    if (typeof originalShowPicker === "function") {
+      proto.showPicker = function interceptShowPicker() {
+        if (this.type === "file") {
+          assignFilesToInput(this, files);
+          return;
+        }
+        return originalShowPicker.apply(this, arguments);
+      };
     }
 
-    return Boolean(await waitForPreview(dialog, before, 20000));
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node.nodeType !== 1) {
+            continue;
+          }
+          const inputs = node.matches?.('input[type="file"]')
+            ? [node]
+            : [...(node.querySelectorAll?.('input[type="file"]') || [])];
+          for (const input of inputs) {
+            assignFilesToInput(input, files);
+          }
+        }
+      }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+
+    return () => {
+      proto.click = originalClick;
+      if (typeof originalShowPicker === "function") {
+        proto.showPicker = originalShowPicker;
+      }
+      observer.disconnect();
+    };
   }
 
   function waitForPreview(dialog, before, timeout) {
@@ -607,9 +782,18 @@
     const dt = createFileTransfer(files);
     input.removeAttribute("disabled");
     try {
-      input.files = dt.files;
+      const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files");
+      if (desc?.set) {
+        desc.set.call(input, dt.files);
+      } else {
+        input.files = dt.files;
+      }
     } catch {
-      return false;
+      try {
+        input.files = dt.files;
+      } catch {
+        return false;
+      }
     }
     if (!input.files || input.files.length === 0) {
       return false;
@@ -660,14 +844,9 @@
   }
 
   function countMediaPreviews(root) {
-    return [...root.querySelectorAll("img")].filter((img) => {
-      const src = img.currentSrc || img.src || "";
-      const rect = img.getBoundingClientRect();
-      return (
-        rect.width >= 48 &&
-        rect.height >= 48 &&
-        (src.startsWith("blob:") || src.startsWith("data:") || /scontent|fbcdn/i.test(src))
-      );
+    return [...root.querySelectorAll("img, [data-visualcompletion='media-vc-image']")].filter((el) => {
+      const rect = el.getBoundingClientRect();
+      return rect.width >= 72 && rect.height >= 72;
     }).length;
   }
 
