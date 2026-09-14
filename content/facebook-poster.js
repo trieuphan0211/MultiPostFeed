@@ -1205,7 +1205,14 @@
     return true;
   }
 
-  // Facebook nhóm hay hiện dialog xác nhận (Đăng / Tiếp / Xác nhận) hoặc cần bấm Đăng thêm một lần.
+  // Chỉ chờ dialog modal đóng. Ô "Viết gì đó" trên feed vẫn mở không có nghĩa là chưa đăng.
+  function findComposerModal() {
+    const layers = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')];
+    return (
+      layers.find((layer) => !isIgnoredComposerLayer(layer) && findComposerTextbox(layer)) || null
+    );
+  }
+
   async function finishPostSubmission() {
     await sleep(800);
 
@@ -1214,9 +1221,9 @@
     let composerRetries = 0;
 
     while (Date.now() < deadline) {
-      const composer = findComposerDialog();
-      const confirmLayer = findConfirmLayer(composer);
-      if (!composer && !confirmLayer) {
+      const modal = findComposerModal();
+      const confirmLayer = findConfirmLayer(modal);
+      if (!modal && !confirmLayer) {
         return { ok: true };
       }
 
@@ -1235,8 +1242,8 @@
         }
       }
 
-      if (composer && !confirmLayer && composerRetries < 1 && !isUploading(composer)) {
-        const button = findPostButton(composer);
+      if (modal && !confirmLayer && composerRetries < 1 && !isUploading(modal)) {
+        const button = findPostButton(modal);
         if (button && !isDisabled(button)) {
           humanClick(button);
           composerRetries += 1;
@@ -1248,7 +1255,7 @@
       await sleep(250);
     }
 
-    if (!findComposerDialog() && !findConfirmLayer(findComposerDialog())) {
+    if (!findComposerModal() && !findConfirmLayer(findComposerModal())) {
       return { ok: true };
     }
     return {
