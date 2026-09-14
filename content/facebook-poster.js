@@ -44,6 +44,31 @@
 
   const POST_LABELS = ["đăng", "dang", "post", "đăng bài", "dang bai"];
 
+  const CONFIRM_LABELS = [
+    "đăng lên nhóm",
+    "dang len nhom",
+    "post to group",
+    "post anyway",
+    "đăng anyway",
+    "đăng bài",
+    "dang bai",
+    "xác nhận",
+    "xac nhan",
+    "confirm",
+    "tiếp tục",
+    "tiep tuc",
+    "continue",
+    "tiếp",
+    "tiep",
+    "next",
+    "đăng",
+    "dang",
+    "post",
+    "ok",
+    "xong",
+    "done",
+  ];
+
   const GROUP_PATH_SKIP = new Set([
     "feed",
     "joins",
@@ -157,12 +182,9 @@
       };
     }
 
-    const closed = await waitFor(() => !findComposerDialog(), 15000);
-    if (!closed) {
-      return {
-        success: false,
-        error: "Composer vẫn mở sau khi bấm Đăng. Facebook có thể đang hỏi xác nhận.",
-      };
+    const submitted = await finishPostSubmission();
+    if (!submitted.ok) {
+      return { success: false, error: submitted.error };
     }
 
     return { success: true, postUrl: await findPostedPermalink(text, knownUrls) };
@@ -1181,6 +1203,115 @@
 
     humanClick(button);
     return true;
+  }
+
+  // Facebook nhóm hay hiện dialog xác nhận (Đăng / Tiếp / Xác nhận) hoặc cần bấm Đăng thêm một lần.
+  async function finishPostSubmission() {
+    await sleep(800);
+
+    const deadline = Date.now() + 20000;
+    let confirmClicks = 0;
+    let composerRetries = 0;
+
+    while (Date.now() < deadline) {
+      const composer = findComposerDialog();
+      const confirmLayer = findConfirmLayer(composer);
+      if (!composer && !confirmLayer) {
+        return { ok: true };
+      }
+
+      const blocked = composerBlockReason(confirmLayer);
+      if (blocked) {
+        return { ok: false, error: blocked };
+      }
+
+      if (confirmLayer && confirmClicks < 2 && !isUploading(confirmLayer)) {
+        const button = findConfirmButton(confirmLayer);
+        if (button && !isDisabled(button)) {
+          humanClick(button);
+          confirmClicks += 1;
+          await sleep(700);
+          continue;
+        }
+      }
+
+      if (composer && !confirmLayer && composerRetries < 1 && !isUploading(composer)) {
+        const button = findPostButton(composer);
+        if (button && !isDisabled(button)) {
+          humanClick(button);
+          composerRetries += 1;
+          await sleep(1000);
+          continue;
+        }
+      }
+
+      await sleep(250);
+    }
+
+    if (!findComposerDialog() && !findConfirmLayer(findComposerDialog())) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      error: "Composer vẫn mở sau khi bấm Đăng. Facebook có thể đang hỏi xác nhận.",
+    };
+  }
+
+  function findConfirmLayer(composer) {
+    const layers = [...document.querySelectorAll('[role="dialog"], [aria-modal="true"]')].filter(
+      (layer) => !isIgnoredComposerLayer(layer) && isVisible(layer)
+    );
+    for (let index = layers.length - 1; index >= 0; index -= 1) {
+      const layer = layers[index];
+      if (layer === composer) {
+        continue;
+      }
+      if (composer && layer.contains(composer)) {
+        continue;
+      }
+      if (findConfirmButton(layer)) {
+        return layer;
+      }
+    }
+    return null;
+  }
+
+  function findConfirmButton(root) {
+    if (!root) {
+      return null;
+    }
+    const button = findClickableByTexts(root, CONFIRM_LABELS);
+    if (!button || isConfirmExcluded(button)) {
+      return null;
+    }
+    return button;
+  }
+
+  function isConfirmExcluded(el) {
+    const label = visibleLabel(el);
+    return /dang nhap|dang ky|log in|login|sign up|binh luan|comment|huy|cancel|dong|close|not now|de sau/.test(
+      label
+    );
+  }
+
+  function composerBlockReason(root) {
+    if (!root) {
+      return "";
+    }
+    const alerts = [
+      ...root.querySelectorAll('[role="alert"], [role="status"], [aria-live="assertive"]'),
+    ];
+    const text = normalize(alerts.map((el) => el.innerText || "").join(" "));
+    if (!text) {
+      return "";
+    }
+    if (/khong the dang|khong dang duoc|couldnt (be )?(share|post)|try again later/.test(text)) {
+      return "Facebook từ chối bài đăng.";
+    }
+    if (/captcha|security check|checkpoint|xac nhan danh tinh/.test(text)) {
+      return "Facebook đang hỏi xác minh (captcha/checkpoint).";
+    }
+    return "";
   }
 
   function findPostButton(root) {
