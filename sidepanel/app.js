@@ -318,7 +318,7 @@ function renderQueue(items) {
       <span class="badge badge-${item.status}"></span>
     `;
     li.querySelector("strong").textContent = item.groupName;
-    li.querySelector("small").textContent = item.error || item.url;
+    li.querySelector("small").textContent = item.postUrl || item.error || item.url;
     li.querySelector(".badge").textContent = ITEM_LABEL[item.status] || item.status;
     els.queueList.appendChild(li);
   }
@@ -335,7 +335,9 @@ function renderHistory(history) {
     if (!query) {
       return true;
     }
-    const haystack = normalizeFilter(`${entry.groupName || ""} ${entry.textPreview || ""} ${entry.error || ""}`);
+    const haystack = normalizeFilter(
+      `${entry.groupName || ""} ${entry.textPreview || ""} ${entry.error || ""} ${entry.postUrl || ""}`
+    );
     return haystack.includes(query);
   });
 
@@ -355,14 +357,29 @@ function renderHistory(history) {
     li.querySelector("strong").textContent = entry.groupName;
     li.querySelector("small").textContent = formatHistory(entry);
     li.querySelector(".badge").textContent = ITEM_LABEL[entry.status] || entry.status;
+    if (entry.postUrl) {
+      const linkLine = document.createElement("small");
+      linkLine.className = "history-link";
+      linkLine.textContent = entry.postUrl;
+      li.querySelector("small").after(linkLine);
+    }
 
     const actions = li.querySelector(".history-actions");
     const openBtn = document.createElement("button");
     openBtn.type = "button";
     openBtn.className = "ghost";
-    openBtn.textContent = "Mở";
+    openBtn.textContent = entry.postUrl ? "Mở bài" : "Mở nhóm";
     openBtn.addEventListener("click", () => openHistory(entry));
     actions.appendChild(openBtn);
+
+    if (entry.postUrl) {
+      const copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "ghost";
+      copyBtn.textContent = "Sao chép";
+      copyBtn.addEventListener("click", () => copyPostUrl(entry.postUrl));
+      actions.appendChild(copyBtn);
+    }
 
     if (entry.groupId) {
       const busy =
@@ -675,6 +692,15 @@ async function openHistory(entry) {
     return;
   }
   await chrome.tabs.create({ url: target, active: true });
+}
+
+async function copyPostUrl(url) {
+  try {
+    await navigator.clipboard.writeText(url);
+    showNotice("Đã sao chép link bài đăng.", true);
+  } catch {
+    showNotice("Không sao chép được link bài đăng.");
+  }
 }
 
 async function repostHistory(entry) {

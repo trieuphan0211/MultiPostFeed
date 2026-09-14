@@ -148,6 +148,7 @@
     }
 
     dialog = findComposerDialog() || dialog;
+    const knownUrls = collectFeedPermalinks();
     const posted = await clickPostButton(dialog);
     if (!posted) {
       return {
@@ -164,38 +165,176 @@
       };
     }
 
-    return { success: true, postUrl: await findPostedPermalink(text) };
+    return { success: true, postUrl: await findPostedPermalink(text, knownUrls) };
   }
 
-  async function findPostedPermalink(text) {
+  async function findPostedPermalink(text, knownUrls = new Set()) {
     const snippet = String(text || "")
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 48);
-    await sleep(1500);
+    const deadline = Date.now() + 10000;
 
-    const articles = [...document.querySelectorAll('[role="article"]')].slice(0, 8);
-    for (const article of articles) {
-      const body = (article.innerText || "").replace(/\s+/g, " ");
-      if (snippet && !body.includes(snippet.slice(0, 24))) {
+    while (Date.now() < deadline) {
+      const found = permalinkFromToast() || permalinkFromFeed(snippet, knownUrls);
+      if (found) {
+        return found;
+      }
+      await sleep(400);
+    }
+    return permalinkFromToast() || permalinkFromFeed(snippet, knownUrls) || "";
+  }
+
+  function permalinkFromToast() {
+    const live = [
+      ...document.querySelectorAll('[role="status"], [role="alert"], [aria-live]'),
+    ];
+    for (const node of live) {
+      const label = normalize(node.innerText || node.getAttribute("aria-label") || "");
+      if (!/(da dang|posted|published|bai viet cua ban|your post|cho phe duyet|pending)/.test(label)) {
         continue;
       }
-      const link = article.querySelector(
-        'a[href*="/posts/"], a[href*="/permalink"], a[href*="story_fbid"]'
-      );
-      if (!link?.href) {
-        continue;
-      }
-      try {
-        const parsed = new URL(link.href, location.origin);
-        parsed.search = "";
-        parsed.hash = "";
-        return parsed.toString();
-      } catch {
-        return link.href;
+      for (const link of node.querySelectorAll("a[href]")) {
+        const url = cleanPostUrl(link.href);
+        if (url) {
+          return url;
+        }
       }
     }
     return "";
+  }
+
+  function permalinkFromFeed(snippet, knownUrls = new Set()) {
+    const main = document.querySelector('[role="main"]') || document.body;
+    const articles = [...main.querySelectorAll('[role="article"]')].slice(0, 12);
+    const scored = [];
+
+    for (const article of articles) {
+      const url = permalinkInNode(article);
+      if (!url) {
+        continue;
+      }
+      const body = (article.innerText || "").replace(/\s+/g, " ");
+      const bodyNorm = normalize(body);
+      let score = 0;
+      if (!knownUrls.has(url)) {
+        score += 4;
+      }
+      if (snippet && body.includes(snippet.slice(0, 24))) {
+        score += 5;
+      }
+      if (isFreshTimestamp(bodyNorm)) {
+        score += 3;
+      }
+      if (score === 0) {
+        continue;
+      }
+      scored.push({ url, score });
+    }
+
+    scored.sort((a, b) => b.score - a.score);
+    if (scored[0] && (!knownUrls.has(scored[0].url) || scored[0].score >= 8)) {
+      return scored[0].url;
+    }
+
+    for (const article of articles.slice(0, 3)) {
+      const url = permalinkInNode(article);
+      if (url && !knownUrls.has(url)) {
+        return url;
+      }
+    }
+    return "";
+  }
+
+  function collectFeedPermalinks() {
+    const urls = new Set();
+    const main = document.querySelector('[role="main"]') || document.body;
+    for (const link of main.querySelectorAll("a[href]")) {
+      const url = cleanPostUrl(link.href);
+      if (url) {
+        urls.add(url);
+      }
+    }
+    return urls;
+  }
+
+  function permalinkInNode(root) {
+    if (!root) {
+      return "";
+    }
+    for (const link of root.querySelectorAll("a[href]")) {
+      const url = cleanPostUrl(link.href);
+      if (url) {
+        return url;
+      }
+    }
+    return "";
+  }
+
+  function isFreshTimestamp(text) {
+    return /(vua xong|vua moi|just now|a few seconds|giay truoc|\b1 m\b|\b1 phut|\b1 min)/.test(
+      text
+    );
+  }
+
+  function unwrapFacebookHref(href) {
+    try {
+      const parsed = new URL(href, location.origin);
+      if (parsed.hostname === "l.facebook.com" || parsed.pathname === "/l.php") {
+        return parsed.searchParams.get("u") || href;
+      }
+      return parsed.href;
+    } catch {
+      return href;
+    }
+  }
+
+  function isPostPermalink(href) {
+    if (!href) {
+      return false;
+    }
+    let parsed;
+    try {
+      parsed = new URL(unwrapFacebookHref(href), location.origin);
+    } catch {
+      return false;
+    }
+    if (!/(^|\.)facebook\.com$/i.test(parsed.hostname)) {
+      return false;
+    }
+    const path = parsed.pathname;
+    const search = parsed.search;
+    return (
+      /\/(?:groups\/[^/]+\/)?posts\/[^/?#]+/i.test(path) ||
+      /\/permalink\/[^/?#]+/i.test(path) ||
+      /\/permalink\.php$/i.test(path) ||
+      /\/story\.php$/i.test(path) ||
+      /story_fbid=/i.test(search) ||
+      /multi_permalinks=/i.test(search) ||
+      /\/share\/[pv]\//i.test(path) ||
+      /\/videos\/\d+/i.test(path) ||
+      /\/reel\/[^/?#]+/i.test(path) ||
+      /(?:\?|&)fbid=/i.test(search)
+    );
+  }
+
+  function cleanPostUrl(href) {
+    if (!isPostPermalink(href)) {
+      return "";
+    }
+    try {
+      const parsed = new URL(unwrapFacebookHref(href), location.origin);
+      const next = new URL(parsed.pathname, `${parsed.protocol}//${parsed.host}`);
+      for (const key of ["story_fbid", "id", "multi_permalinks", "fbid", "v"]) {
+        const value = parsed.searchParams.get(key);
+        if (value) {
+          next.searchParams.set(key, value);
+        }
+      }
+      return next.toString();
+    } catch {
+      return String(href).split("?")[0];
+    }
   }
 
   async function resolvePostImages(images, imageIds) {

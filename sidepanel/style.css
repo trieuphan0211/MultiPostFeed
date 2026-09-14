@@ -330,6 +330,13 @@ button:disabled,
   word-break: break-all;
 }
 
+.history-item .history-link {
+  display: block;
+  color: var(--accent);
+  margin-top: 2px;
+  word-break: break-all;
+}
+
 .history-toolbar {
   display: grid;
   grid-template-columns: 1fr auto;

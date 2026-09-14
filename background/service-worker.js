@@ -165,6 +165,7 @@ async function startQueue({ groupIds, text, imageIds }) {
       url: group.url,
       status: "pending",
       error: "",
+      postUrl: "",
     })),
     currentIndex: 0,
     delayMinSeconds: settings.delayMinSeconds,
@@ -312,7 +313,8 @@ async function runCurrentItem() {
 
     if (result?.success) {
       item.status = "posted";
-      await addHistory(historyEntry(state, item, "posted", "", result.postUrl || ""));
+      item.postUrl = result.postUrl || "";
+      await addHistory(historyEntry(state, item, "posted", "", item.postUrl));
       await persistAndBroadcast(state);
       await advanceOrFinish(state, { skipped: false });
       return;
@@ -476,12 +478,142 @@ async function preflightFacebook() {
   return { ok: true, tabId: usable.id };
 }
 
+async function getUserFocus() {
+  try {
+    const win = await chrome.windows.getLastFocused();
+    if (!win?.id) {
+      return { windowId: null, tabId: null };
+    }
+    const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+    return { windowId: win.id, tabId: tab?.id || null };
+  } catch {
+    return { windowId: null, tabId: null };
+  }
+}
+
+async function restoreUserFocus(focus, facebookTabId) {
+  if (!focus?.windowId) {
+    return;
+  }
+
+  const current = await getUserFocus();
+  if (
+    current.tabId &&
+    current.tabId !== focus.tabId &&
+    current.tabId !== facebookTabId
+  ) {
+    return;
+  }
+
+  // Không trả focus nếu tab Facebook vẫn cùng cửa sổ — restore sẽ ẩn composer.
+  if (facebookTabId) {
+    try {
+      const fbTab = await chrome.tabs.get(facebookTabId);
+      if (fbTab.windowId === focus.windowId && fbTab.id !== focus.tabId) {
+        return;
+      }
+    } catch {
+      // Tab Facebook đã đóng.
+    }
+  }
+
+  try {
+    await chrome.windows.update(focus.windowId, { focused: true });
+  } catch {
+    // Cửa sổ người dùng đã đóng.
+  }
+  if (focus.tabId) {
+    try {
+      await chrome.tabs.update(focus.tabId, { active: true });
+    } catch {
+      // Tab người dùng đã đóng.
+    }
+  }
+}
+
+// Facebook chỉ render composer khi tab đang được chọn trong cửa sổ của nó.
+// Tách tab sang cửa sổ riêng (không focus) để không cướp tab người dùng đang xem.
+async function detachFromUserWindow(tabId, userFocus) {
+  const tab = await chrome.tabs.get(tabId);
+  const userWatching = Boolean(userFocus.tabId && userFocus.tabId === tabId);
+  const sameWindow = Boolean(userFocus.windowId && tab.windowId === userFocus.windowId);
+  if (userWatching || !sameWindow) {
+    return false;
+  }
+
+  // Recheck ngay trước khi tách: nếu còn 1 tab thì windows.create sẽ đóng cửa sổ user.
+  const siblings = await chrome.tabs.query({ windowId: tab.windowId });
+  if (siblings.length <= 1) {
+    return false;
+  }
+
+  try {
+    await chrome.windows.create({
+      tabId,
+      focused: false,
+      width: 1100,
+      height: 800,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function openUrlWithoutStealingFocus(tabId, url, userFocus) {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    await chrome.tabs.update(tabId, { autoDiscardable: false });
+    if (tab.discarded) {
+      await chrome.tabs.reload(tabId);
+    }
+  } catch {
+    throw new Error("Tab Facebook đã bị đóng.");
+  }
+
+  await detachFromUserWindow(tabId, userFocus);
+  await chrome.tabs.update(tabId, { url, active: true, autoDiscardable: false });
+  if (userFocus.tabId !== tabId) {
+    await restoreUserFocus(userFocus, tabId);
+  }
+}
+
+async function createBackgroundFacebookTab(url, userFocus) {
+  try {
+    const worker = await chrome.windows.create({
+      url,
+      focused: false,
+      width: 1100,
+      height: 800,
+    });
+    const tabId = worker?.tabs?.[0]?.id;
+    if (tabId) {
+      await chrome.tabs.update(tabId, { autoDiscardable: false });
+      await restoreUserFocus(userFocus, tabId);
+      return tabId;
+    }
+    if (worker?.id) {
+      await chrome.windows.remove(worker.id).catch(() => {});
+    }
+  } catch {
+    // Fallback: mở tab rồi tách sang cửa sổ riêng.
+  }
+
+  const tab = await chrome.tabs.create({ url, active: false });
+  await detachFromUserWindow(tab.id, userFocus);
+  await chrome.tabs.update(tab.id, { active: true, autoDiscardable: false });
+  await restoreUserFocus(userFocus, tab.id);
+  return tab.id;
+}
+
 async function ensureGroupTab(state, url) {
+  const userFocus = await getUserFocus();
+
   if (state.tabId) {
     try {
       const tab = await chrome.tabs.get(state.tabId);
       if (tab && /facebook\.com/.test(tab.url || "")) {
-        await chrome.tabs.update(state.tabId, { url, active: true });
+        await openUrlWithoutStealingFocus(state.tabId, url, userFocus);
         await waitForTabReady(state.tabId, url);
         return state.tabId;
       }
@@ -490,11 +622,11 @@ async function ensureGroupTab(state, url) {
     }
   }
 
-  const tab = await chrome.tabs.create({ url, active: true });
-  state.tabId = tab.id;
+  const tabId = await createBackgroundFacebookTab(url, userFocus);
+  state.tabId = tabId;
   await setQueueState(state);
-  await waitForTabReady(tab.id, url);
-  return tab.id;
+  await waitForTabReady(tabId, url);
+  return tabId;
 }
 
 function urlMatchesGroup(tabUrl, targetUrl) {
@@ -1006,11 +1138,13 @@ async function scanJoinedGroups() {
 }
 
 async function ensureFacebookDirectoryTab(existingTabId) {
+  const userFocus = await getUserFocus();
+
   if (existingTabId) {
     try {
       const tab = await chrome.tabs.get(existingTabId);
       if (tab && /facebook\.com/.test(tab.url || "")) {
-        await chrome.tabs.update(existingTabId, { url: JOINS_URL, active: true });
+        await openUrlWithoutStealingFocus(existingTabId, JOINS_URL, userFocus);
         await waitForTabMatch(existingTabId, isGroupsDirectoryUrl);
         return existingTabId;
       }
@@ -1022,14 +1156,14 @@ async function ensureFacebookDirectoryTab(existingTabId) {
   const existing = await chrome.tabs.query({ url: "*://*.facebook.com/*" });
   const reusable = existing[0];
   if (reusable?.id) {
-    await chrome.tabs.update(reusable.id, { url: JOINS_URL, active: true });
+    await openUrlWithoutStealingFocus(reusable.id, JOINS_URL, userFocus);
     await waitForTabMatch(reusable.id, isGroupsDirectoryUrl);
     return reusable.id;
   }
 
-  const tab = await chrome.tabs.create({ url: JOINS_URL, active: true });
-  await waitForTabMatch(tab.id, isGroupsDirectoryUrl);
-  return tab.id;
+  const tabId = await createBackgroundFacebookTab(JOINS_URL, userFocus);
+  await waitForTabMatch(tabId, isGroupsDirectoryUrl);
+  return tabId;
 }
 
 async function waitForTabMatch(tabId, matchFn) {
